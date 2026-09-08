@@ -41,7 +41,7 @@ _NODE_FIELDS = {
     # create; to change it later, point check_method/check_target at the device
     # and let the status checker observe it.
     "status":        {"type": "string", "enum": ["online", "offline", "unknown", "pending"], "description": "Live status. Honoured on create; on update it is ignored unless the device's status is still unknown — the status checker owns it."},
-    "check_method":  {"type": "string", "description": "Status check method (ping, http, https, ssh, prometheus, tcp)."},
+    "check_method":  {"type": "string", "description": "Status check method (ping, nmap, http, https, ssh, prometheus, tcp)."},
     "check_target":  {"type": "string", "description": "Target host/URL used by the status check."},
     "services":      {"type": "array", "items": {"type": "object"}, "description": "Running services detected or documented on the node."},
     "notes":         {"type": "string", "description": "Free-text notes / documentation for the node."},

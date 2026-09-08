@@ -75,7 +75,7 @@ function CPStepper({ label, side, value, onChange }: {
   )
 }
 
-const CHECK_METHODS: CheckMethod[] = ['none', 'ping', 'http', 'https', 'tcp', 'ssh', 'prometheus', 'health']
+const CHECK_METHODS: CheckMethod[] = ['none', 'ping', 'nmap', 'http', 'https', 'tcp', 'ssh', 'prometheus', 'health']
 const CONTAINER_MODE_TYPES: NodeType[] = ['proxmox', 'vm', 'lxc', 'docker_host']
 const ZIGBEE_TYPES: NodeType[] = ['zigbee_coordinator', 'zigbee_router', 'zigbee_enddevice']
 const ZWAVE_TYPES: NodeType[] = ['zwave_coordinator', 'zwave_router', 'zwave_enddevice']
@@ -85,6 +85,7 @@ const MESH_TYPES: NodeType[] = [...ZIGBEE_TYPES, ...ZWAVE_TYPES]
 const CHECK_METHOD_LABELS: Record<CheckMethod, string> = {
   none: 'None',
   ping: 'Ping',
+  nmap: 'Nmap',
   http: 'HTTP',
   https: 'HTTPS',
   tcp: 'TCP',

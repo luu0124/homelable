@@ -216,6 +216,7 @@ Nodes: `proxmox` (host) / `vm` / `lxc`, linked host→guest by a `virtual` edge.
   | Method | Checks |
   |--------|--------|
   | `ping` | ICMP reachability |
+  | `nmap` | `nmap -sn` host discovery — ARP on the local segment, catching ICMP-filtered devices. A `host:port` target probes with a TCP SYN ping instead |
   | `http` | GET, OK if status < 500 |
   | `https` | GET with TLS verify |
   | `tcp` | TCP connect to `host:port` |

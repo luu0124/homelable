@@ -35,7 +35,7 @@ _DEVICE_FIELDS = {
     "ram_gb": {"type": "number"},
     "disk_gb": {"type": "number"},
     "show_hardware": {"type": "boolean"},
-    "check_method": {"type": "string", "description": "Status check method (ping, http, https, ssh, prometheus, tcp)."},
+    "check_method": {"type": "string", "description": "Status check method (ping, nmap, http, https, ssh, prometheus, tcp)."},
     "check_target": {"type": "string"},
 }
 

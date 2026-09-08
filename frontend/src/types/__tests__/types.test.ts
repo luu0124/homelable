@@ -37,11 +37,11 @@ describe('EDGE_TYPE_LABELS', () => {
 
 describe('CheckMethod', () => {
   it('includes none as a valid check method', () => {
-    const methods: CheckMethod[] = ['none', 'ping', 'http', 'https', 'tcp', 'ssh', 'prometheus', 'health']
+    const methods: CheckMethod[] = ['none', 'ping', 'nmap', 'http', 'https', 'tcp', 'ssh', 'prometheus', 'health']
     // All values are valid CheckMethod — this is a compile-time type check;
     // runtime test just ensures the array is well-formed
     expect(methods).toContain('none')
     expect(methods).toContain('ping')
-    expect(methods.length).toBe(8)
+    expect(methods.length).toBe(9)
   })
 })

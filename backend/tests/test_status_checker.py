@@ -6,6 +6,7 @@ import pytest
 
 from app.services.status_checker import (
     _http_get,
+    _nmap_ping,
     _ping,
     _tcp_connect,
     check_node,
@@ -673,3 +674,130 @@ async def test_check_service_http_exception_returns_offline():
         side_effect=RuntimeError("connection refused"),
     ):
         assert await check_service(svc, "10.0.0.1") == "offline"
+
+
+class _FakeProc:
+    """Stand-in for an asyncio subprocess: canned stdout and return code."""
+
+    def __init__(self, stdout: bytes, returncode: int = 0, stderr: bytes = b""):
+        self._stdout = stdout
+        self._stderr = stderr
+        self.returncode = returncode
+
+    async def communicate(self):
+        return self._stdout, self._stderr
+
+
+_NMAP_UP = (
+    b"Nmap scan report for 192.168.1.10\nHost is up (0.0012s latency).\n"
+    b"Nmap done: 1 IP address (1 host up) scanned in 0.05 seconds\n"
+)
+_NMAP_DOWN = (
+    b"Note: Host seems down. If it is really up, but blocking our ping probes, try -Pn\n"
+    b"Nmap done: 1 IP address (0 hosts up) scanned in 3.03 seconds\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_nmap_ping_uses_sn_n_and_reports_up():
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        return _FakeProc(_NMAP_UP)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+        assert await _nmap_ping("192.168.1.10") is True
+
+    assert captured["args"][:4] == ("nmap", "-sn", "-n", "--host-timeout")
+    assert captured["args"][-1] == "192.168.1.10"
+
+
+@pytest.mark.asyncio
+async def test_nmap_ping_offline_when_no_host_is_up_line():
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc(_NMAP_DOWN)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+        assert await _nmap_ping("192.168.1.10") is False
+
+
+@pytest.mark.asyncio
+async def test_nmap_ping_adds_ipv6_flag():
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        return _FakeProc(_NMAP_UP)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+        assert await _nmap_ping("fe80::1") is True
+
+    assert "-6" in captured["args"]
+
+
+@pytest.mark.asyncio
+async def test_check_node_nmap_routes_to_nmap_ping():
+    captured = {}
+
+    async def fake_nmap(host):
+        captured["host"] = host
+        return True
+
+    with patch("app.services.status_checker._nmap_ping", side_effect=fake_nmap):
+        result = await check_node("nmap", None, "192.168.1.10, 10.0.0.5")
+
+    assert captured["host"] == "192.168.1.10"
+    assert result["status"] == "online"
+
+
+@pytest.mark.asyncio
+async def test_nmap_ping_keeps_n_for_ip_targets():
+    """-n on a literal address only skips the pointless reverse lookup."""
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        return _FakeProc(_NMAP_UP)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+        await _nmap_ping("192.168.1.10")
+
+    assert "-n" in captured["args"]
+
+
+@pytest.mark.asyncio
+async def test_nmap_ping_drops_n_for_hostname_targets():
+    """-n disables forward resolution too: nmap would quit on a name."""
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        return _FakeProc(_NMAP_UP)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+        await _nmap_ping("nas.lan")
+
+    assert "-n" not in captured["args"]
+    assert captured["args"][-1] == "nas.lan"
+
+
+@pytest.mark.asyncio
+async def test_nmap_ping_strips_scheme_and_uses_port_as_syn_probe():
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        return _FakeProc(_NMAP_UP)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+        await _nmap_ping("https://192.168.1.10:8443/status")
+
+    assert "-PS8443" in captured["args"]
+    assert captured["args"][-1] == "192.168.1.10"
+
+
+@pytest.mark.asyncio
+async def test_nmap_ping_reports_offline_when_binary_missing():
+    with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
+        assert await _nmap_ping("192.168.1.10") is False

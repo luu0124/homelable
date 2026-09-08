@@ -1,4 +1,4 @@
-"""Per-node status checks: ping, http, https, tcp, ssh, prometheus, health, none."""
+"""Per-node status checks: ping, nmap, http, https, tcp, ssh, prometheus, health, none."""
 import asyncio
 import logging
 import socket
@@ -35,6 +35,8 @@ async def check_node(check_method: str, target: str | None, ip: str | None) -> d
         match check_method:
             case "ping":
                 ok = await _ping(host)
+            case "nmap":
+                ok = await _nmap_ping(host)
             case "http":
                 url = host if host.startswith("http") else f"http://{host}"
                 ok = await _http_get(url)
@@ -100,6 +102,83 @@ async def _ping(host: str) -> bool:
     )
     await proc.wait()
     return proc.returncode == 0
+
+
+def _is_ip_literal(host: str) -> bool:
+    """True if host is a literal IPv4 or IPv6 address (not a name)."""
+    if _is_ipv6(host):
+        return True
+    try:
+        socket.inet_pton(socket.AF_INET, host)
+        return True
+    except OSError:
+        return False
+
+
+async def _nmap_ping(host: str) -> bool:
+    # `nmap -sn -n <ip>`: host discovery only (no port scan). On a local segment
+    # nmap also probes ARP, so it sees devices that drop ICMP and would look
+    # offline to `ping`.
+    #
+    # The stored check target is not always a bare address — a device switched
+    # over from `http` or `tcp` still carries `https://host:8443` — and nmap
+    # takes a host, not a URL, so reuse the service parser to split off scheme,
+    # path and port.
+    target, _, port = _parse_override(host)
+    if not target:
+        return False
+
+    args = ["nmap", "-sn"]
+    # -n disables name resolution in *both* directions: with it, nmap answers a
+    # hostname target with "Failed to resolve" and quits, reporting every named
+    # device offline. Keep it for literal addresses, where it only saves the
+    # pointless reverse lookup.
+    if _is_ip_literal(target):
+        args.append("-n")
+    if _is_ipv6(target):
+        args.append("-6")
+    if port is not None:
+        # Default -sn probes (ICMP echo + timestamp, SYN 443, ACK 80) are what
+        # a firewalled host off the local segment drops wholesale — nmap then
+        # says "host seems down" about a machine that is plainly serving. A SYN
+        # ping to a port known to be open gets through, so a check target
+        # written as `host:port` picks that probe instead.
+        args.append(f"-PS{port}")
+    args += ["--host-timeout", "5s", target]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        # Otherwise this surfaces as a plain "offline", which looks like a real
+        # verdict about the device rather than a missing binary.
+        logger.warning("nmap check requested but the nmap binary is not installed")
+        return False
+
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        logger.warning("nmap check timed out for %s", target)
+        return False
+
+    # nmap exits 0 whether or not the host answered, so the verdict comes from
+    # the report: an unreachable host prints "0 hosts up" and no "Host is up".
+    if proc.returncode == 0 and b"Host is up" in stdout:
+        return True
+
+    # A device the admin believes is online reads as a bug, and check_node logs
+    # only at debug, so say why here: unresolvable name, no permission, no
+    # route — all of them land in this same "offline".
+    detail = " ".join((stderr or stdout).decode(errors="replace").split())
+    logger.warning(
+        "nmap reported %s not up (rc=%s): %s", target, proc.returncode, detail[:300]
+    )
+    return False
 
 
 async def _http_get(url: str, verify: bool = False) -> bool:

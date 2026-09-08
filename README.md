@@ -171,12 +171,19 @@ Homelable continuously monitors your nodes and displays their live status (onlin
 | Method | Description |
 |--------|-------------|
 | `ping` | ICMP ping |
+| `nmap` | `nmap -sn` host discovery (ARP on the local segment, so it also sees devices that drop ICMP) |
 | `http` | GET request, success if status < 500 |
 | `https` | GET with TLS verify |
 | `tcp` | TCP connect (target: `host:port`) |
 | `ssh` | TCP connect to port 22 |
 | `prometheus` | GET `/metrics` |
 | `health` | GET `/health` |
+
+`nmap` probes the way the scanner does. On the local segment that means ARP,
+which answers for devices that ignore ICMP. A host on another network that
+filters everything still reads as offline — nmap says *"Host seems down"* — so
+give it a port it does answer on: a check target written as `host:port` makes
+the probe a TCP SYN ping to that port (`-PS<port>`).
 
 ---
 
