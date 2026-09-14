@@ -199,10 +199,27 @@ def merge_properties(base: list[Any] | None, incoming: list[Any] | None) -> list
     return out
 
 
-def _service_key(svc: Any) -> Any:
+def _service_identity_key(svc: Any) -> Any:
+    """What makes two service entries *the same service*, for merging.
+
+    A port is the identity: one port on one protocol is one service, whatever it
+    is called. The name is a label on it — the scanner guesses it from a banner
+    and the user corrects it — so keying identity on the name made a rename look
+    like a second service, and the next scan re-added the original under its own
+    guess (issue #469). :func:`_service_view_key` renders the same identity, so
+    the two never disagree about what one service is; keys already persisted in
+    node views are narrowed to it on read by :func:`normalize_view_key`.
+
+    Only a service with no port falls back to the name, because nothing else
+    tells two of them apart — a hand-added entry that names a host rather than a
+    port, say. Those still key exactly as they did.
+    """
     if not isinstance(svc, dict):
         return repr(svc)
-    return (svc.get("port"), svc.get("protocol"), (svc.get("service_name") or "").lower())
+    port = svc.get("port")
+    if port in (None, ""):
+        return (None, svc.get("protocol"), (svc.get("service_name") or "").lower())
+    return (port, svc.get("protocol"))
 
 
 # --- Per-node view of the device's list facts -----------------------------
@@ -215,8 +232,53 @@ VIEW_LISTS = ("services", "properties")
 
 
 def _service_view_key(svc: Any) -> str:
-    port, protocol, name = _service_key(svc) if isinstance(svc, dict) else (None, None, repr(svc))
-    return f"{port}|{protocol}|{name}"
+    """This service's address in a node's view.
+
+    Same identity as the merge uses, so a rename does not move a service out
+    from under the view that addresses it: before #469 the key carried the name,
+    and renaming a service in the inventory modal made every canvas already
+    drawing it lose track and redraw it hidden.
+
+    A port-less service keeps the three-part form it always had, name included —
+    it is the only thing that identifies one, and rendering ``None`` for the
+    absent port is what the stored keys look like.
+    """
+    if not isinstance(svc, dict):
+        return f"None|None|{repr(svc)}"
+    key = _service_identity_key(svc)
+    if len(key) == 2:
+        return f"{key[0]}|{key[1]}"
+    return f"{key[0]}|{key[1]}|{key[2]}"
+
+
+def normalize_view_key(key: str, kind: str) -> str:
+    """A stored view key in today's form.
+
+    Views written before #469 address a service by ``port|protocol|name``. The
+    name in one is a snapshot of what the service was called when the view was
+    written, so a renamed service cannot be found by re-deriving it — the key
+    has to be narrowed instead. A key that names a port drops everything after
+    it; one that does not is port-less and keeps its name, as does every
+    property key.
+
+    A port-less service renders its absent port as ``None`` today, but a key
+    written for one carrying ``""`` stored an empty segment instead. Both mean
+    the same absent port, so the empty one is spelled the new way rather than
+    left to miss.
+
+    Applied on read, so a view migrates the next time its node is saved rather
+    than needing a migration of its own.
+    """
+    if kind != "services":
+        return key
+    parts = key.split("|", 2)
+    if len(parts) != 3:
+        return key
+    if parts[0] == "":
+        return f"None|{parts[1]}|{parts[2]}"
+    if parts[0] == "None":
+        return key
+    return f"{parts[0]}|{parts[1]}"
 
 
 def _property_view_key(prop: Any) -> str:
@@ -332,7 +394,7 @@ def apply_view(items: list[Any] | None, entries: Any, kind: str) -> list[Any]:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        key = str(entry.get("key"))
+        key = normalize_view_key(str(entry.get("key")), kind)
         item = by_key.get(key)
         if item is None or key in taken:
             continue  # Deleted from the row since — the view catches up on write.
@@ -360,11 +422,13 @@ def _stamped(item: Any, visible: bool) -> Any:
     return {**item, "visible": visible}
 
 
-# How a service looks is the user's call. A fingerprint only ever guesses it
-# from a port number and a banner, so a scan that re-finds a known service must
-# not repaint the icon someone picked by hand — that happened on every "Scan
-# network", across every canvas drawing the device, at once.
-_CURATED_SERVICE_FIELDS = ("icon", "category")
+# How a service looks — and what it is called — is the user's call. A
+# fingerprint only ever guesses it from a port number and a banner, so a scan
+# that re-finds a known service must not repaint the icon someone picked by hand
+# — that happened on every "Scan network", across every canvas drawing the
+# device, at once. `service_name` is curated for the same reason: correcting a
+# bad guess is the point of editing a service, and a rescan must not undo it.
+_CURATED_SERVICE_FIELDS = ("icon", "category", "service_name")
 
 
 def merge_services(
@@ -373,17 +437,28 @@ def merge_services(
     *,
     discovered: bool = False,
 ) -> list[Any]:
-    """Union two service lists on (port, protocol, name); incoming wins.
+    """Union two service lists on (port, protocol); incoming wins.
 
     ``discovered`` marks ``incoming`` as scanner output rather than a user edit:
     it still adds services and refreshes facts, but leaves an established icon
     and category alone. Either way a blank incoming value never clears one that
     is already set — an absent field is silence, not a reset.
+
+    ``base`` is collapsed on the same key as it is copied, so a row that already
+    holds the pre-#469 duplicates heals on the next merge instead of needing a
+    migration. First entry wins: the user's renamed service was there before the
+    scan appended its guess, so it is the one that survives.
     """
-    out: list[Any] = [dict(s) if isinstance(s, dict) else s for s in (base or [])]
-    index = {_service_key(s): i for i, s in enumerate(out)}
+    out: list[Any] = []
+    index: dict[Any, int] = {}
+    for svc in base or []:
+        key = _service_identity_key(svc)
+        if key in index:
+            continue
+        out.append(dict(svc) if isinstance(svc, dict) else svc)
+        index[key] = len(out) - 1
     for svc in incoming or []:
-        key = _service_key(svc)
+        key = _service_identity_key(svc)
         pos = index.get(key)
         if pos is None:
             out.append(dict(svc) if isinstance(svc, dict) else svc)

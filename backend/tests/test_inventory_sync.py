@@ -21,6 +21,7 @@ from app.services.inventory_sync import (
     link_facts,
     merge_properties,
     merge_services,
+    normalize_view_key,
     seed_node_views,
 )
 
@@ -73,7 +74,7 @@ class TestMergeRules:
         assert out[0]["value"] == "A1"
         assert out[0]["icon"] == "Server"
 
-    def test_services_union_on_port_protocol_and_name(self):
+    def test_services_union_on_port_and_protocol(self):
         base = [{"port": 22, "protocol": "tcp", "service_name": "ssh"}]
         incoming = [
             {"port": 22, "protocol": "tcp", "service_name": "SSH", "icon": "Terminal"},
@@ -83,6 +84,77 @@ class TestMergeRules:
         assert len(out) == 2
         assert out[0]["icon"] == "Terminal"
         assert out[1]["port"] == 80
+
+    def test_a_renamed_service_is_not_duplicated_by_the_next_scan(self):
+        """Issue #469: identity is the port, not the name the scanner guessed.
+
+        The user renamed 3001/tcp from "Uptime Kuma" to "Homepage"; the rescan
+        fingerprints the same port and offers its own guess again.
+        """
+        base = [{"port": 3001, "protocol": "tcp", "service_name": "Homepage"}]
+        incoming = [{"port": 3001, "protocol": "tcp", "service_name": "Uptime Kuma"}]
+        out = merge_services(base, incoming, discovered=True)
+        assert len(out) == 1
+        assert out[0]["service_name"] == "Homepage"
+
+    def test_a_scan_still_names_a_service_that_never_had_one(self):
+        out = merge_services(
+            [{"port": 3001, "protocol": "tcp"}],
+            [{"port": 3001, "protocol": "tcp", "service_name": "Uptime Kuma"}],
+            discovered=True,
+        )
+        assert len(out) == 1
+        assert out[0]["service_name"] == "Uptime Kuma"
+
+    def test_a_user_edit_still_renames_a_service(self):
+        """The guard is for scanner output only — an edit is an edit."""
+        out = merge_services(
+            [{"port": 3001, "protocol": "tcp", "service_name": "Uptime Kuma"}],
+            [{"port": 3001, "protocol": "tcp", "service_name": "Homepage"}],
+        )
+        assert len(out) == 1
+        assert out[0]["service_name"] == "Homepage"
+
+    def test_a_scan_refreshes_facts_that_are_not_curated(self):
+        """Only name, icon and category are the user's; the rest is observation."""
+        out = merge_services(
+            [{"port": 3001, "protocol": "tcp", "service_name": "Homepage", "path": "/old"}],
+            [{"port": 3001, "protocol": "tcp", "service_name": "Uptime Kuma", "path": "/new"}],
+            discovered=True,
+        )
+        assert out[0]["service_name"] == "Homepage"
+        assert out[0]["path"] == "/new"
+
+    def test_duplicates_already_on_the_row_collapse_on_the_next_merge(self):
+        """Rows written before the #469 fix heal without a migration.
+
+        First entry wins: the user's rename was there before the scan appended
+        its guess underneath it.
+        """
+        base = [
+            {"port": 3001, "protocol": "tcp", "service_name": "Homepage", "icon": "House"},
+            {"port": 3001, "protocol": "tcp", "service_name": "Uptime Kuma"},
+            {"port": 9090, "protocol": "tcp", "service_name": "Watchtower"},
+            {"port": 9090, "protocol": "tcp", "service_name": "Prometheus"},
+        ]
+        out = merge_services(base, None)
+        assert [s["service_name"] for s in out] == ["Homepage", "Watchtower"]
+        assert out[0]["icon"] == "House"
+
+    def test_port_less_services_still_key_on_their_name(self):
+        """Nothing else tells two of them apart — they must not collapse."""
+        base = [{"protocol": "tcp", "service_name": "Vaultwarden", "host": "vault.lan"}]
+        incoming = [{"protocol": "tcp", "service_name": "Gitea", "host": "git.lan"}]
+        out = merge_services(base, incoming)
+        assert len(out) == 2
+        assert [s["service_name"] for s in out] == ["Vaultwarden", "Gitea"]
+
+    def test_the_same_port_on_udp_and_tcp_stays_two_services(self):
+        out = merge_services(
+            [{"port": 53, "protocol": "tcp", "service_name": "dns"}],
+            [{"port": 53, "protocol": "udp", "service_name": "dns"}],
+        )
+        assert len(out) == 2
 
 
     def test_a_scan_never_repaints_an_icon_the_user_picked(self):
@@ -1338,7 +1410,7 @@ class TestPerNodeView:
         assert await seed_node_views(db_session) == 1
         await db_session.commit()
         assert node.display_view == {
-            "services": [{"key": "22|tcp|ssh", "visible": True}],
+            "services": [{"key": "22|tcp", "visible": True}],
             "properties": [],
         }
         # Idempotent: a second boot finds nothing without a view.
@@ -1471,7 +1543,7 @@ class TestPerNodeView:
         assert await seed_node_views(db_session, drawn=lambda: drawn) == 1
         await db_session.commit()
 
-        assert node.display_view["services"] == [{"key": "22|tcp|ssh", "visible": True}]
+        assert node.display_view["services"] == [{"key": "22|tcp", "visible": True}]
 
     @pytest.mark.asyncio
     async def test_a_node_without_a_view_still_shows_everything(self, db_session):
@@ -1483,3 +1555,133 @@ class TestPerNodeView:
         assert hydrated_node(node, device)["services"] == [
             {"port": 22, "protocol": "tcp", "service_name": "ssh"}
         ]
+
+    @pytest.mark.asyncio
+    async def test_renaming_a_service_does_not_hide_it_on_canvases(
+        self, client: AsyncClient, headers, db_session
+    ):
+        """Issue #469, the view half.
+
+        The view addressed a service by a key carrying its name, so renaming one
+        from the inventory modal left every canvas already drawing it addressing
+        a key the row no longer held — and `apply_view` appends an unlisted fact
+        hidden, so the service vanished from the canvas.
+        """
+        db_session.add(
+            InventoryDevice(
+                id="d-1",
+                ip="10.0.0.5",
+                services=[
+                    {"port": 22, "protocol": "tcp", "service_name": "ssh"},
+                    {"port": 3001, "protocol": "tcp", "service_name": "Uptime Kuma"},
+                ],
+            )
+        )
+        await db_session.commit()
+        node = await self._node_on(client, headers, await _design(db_session))
+
+        res = await client.patch(
+            "/api/v1/scan/pending/d-1",
+            json={"services": [
+                {"port": 22, "protocol": "tcp", "service_name": "ssh"},
+                {"port": 3001, "protocol": "tcp", "service_name": "Homepage"},
+            ]},
+            headers=headers,
+        )
+        assert res.status_code == 200
+
+        drawn = (await client.get(f"/api/v1/nodes/{node['id']}", headers=headers)).json()
+        assert [(s["service_name"], s.get("visible", True)) for s in drawn["services"]] == [
+            ("ssh", True), ("Homepage", True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_view_written_before_the_fix_still_addresses_its_service(
+        self, client: AsyncClient, headers, db_session
+    ):
+        """Old keys are narrowed on read, so nothing needs migrating.
+
+        The hidden one stays hidden even though the row has since renamed it —
+        the point of the key being the port.
+        """
+        db_session.add(
+            InventoryDevice(
+                id="d-1",
+                ip="10.0.0.5",
+                services=[
+                    {"port": 22, "protocol": "tcp", "service_name": "ssh"},
+                    {"port": 3001, "protocol": "tcp", "service_name": "Homepage"},
+                ],
+            )
+        )
+        node = _node(await _design(db_session), device_id="d-1")
+        node.display_view = {
+            "services": [
+                {"key": "22|tcp|ssh", "visible": True},
+                {"key": "3001|tcp|uptime kuma", "visible": False},
+            ],
+            "properties": [],
+        }
+        db_session.add(node)
+        await db_session.commit()
+
+        drawn = (await client.get(f"/api/v1/nodes/{node.id}", headers=headers)).json()
+        assert [(s["service_name"], s.get("visible", True)) for s in drawn["services"]] == [
+            ("ssh", True), ("Homepage", False),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_port_less_service_keeps_its_name_in_the_view_key(self, db_session):
+        """Its name is its identity, so the key keeps the form it always had."""
+        device = InventoryDevice(
+            id="d-1", services=[{"protocol": "tcp", "service_name": "Vaultwarden"}]
+        )
+        node = _node(await _design(db_session), device_id="d-1")
+        node.display_view = {
+            "services": [{"key": "None|tcp|vaultwarden", "visible": False}],
+            "properties": [],
+        }
+        assert hydrated_node(node, device)["services"] == [
+            {"protocol": "tcp", "service_name": "Vaultwarden", "visible": False}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_port_less_key_stored_with_an_empty_port_still_matches(self, db_session):
+        """`port: ""` used to render an empty first segment, `None` renders it now.
+
+        Both spell the same absent port, so the older one is narrowed to today's
+        rather than missing and dragging the service back into view.
+        """
+        device = InventoryDevice(
+            id="d-1", services=[{"port": "", "protocol": "tcp", "service_name": "Vaultwarden"}]
+        )
+        node = _node(await _design(db_session), device_id="d-1")
+        node.display_view = {
+            "services": [{"key": "|tcp|vaultwarden", "visible": False}],
+            "properties": [],
+        }
+        assert hydrated_node(node, device)["services"] == [
+            {"port": "", "protocol": "tcp", "service_name": "Vaultwarden", "visible": False}
+        ]
+
+
+class TestNormalizeViewKey:
+    """Stored view keys, narrowed to the identity the row is addressed by."""
+
+    def test_a_key_naming_a_port_drops_the_name(self):
+        assert normalize_view_key("3001|tcp|uptime kuma", "services") == "3001|tcp"
+
+    def test_a_key_already_in_todays_form_is_left_alone(self):
+        assert normalize_view_key("3001|tcp", "services") == "3001|tcp"
+
+    def test_a_port_less_key_keeps_its_name(self):
+        assert normalize_view_key("None|tcp|vaultwarden", "services") == "None|tcp|vaultwarden"
+
+    def test_an_empty_port_is_spelled_the_way_it_is_rendered_today(self):
+        assert normalize_view_key("|tcp|vaultwarden", "services") == "None|tcp|vaultwarden"
+
+    def test_a_name_carrying_a_pipe_survives_the_split(self):
+        assert normalize_view_key("None|tcp|a|b", "services") == "None|tcp|a|b"
+
+    def test_a_property_key_is_never_touched(self):
+        assert normalize_view_key("rack", "properties") == "rack"

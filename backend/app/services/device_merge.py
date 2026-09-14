@@ -24,7 +24,7 @@ here, so the declared ``ON DELETE SET NULL`` never fires.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import or_, select, update
@@ -37,6 +37,7 @@ from app.services.inventory_sync import (
     ip_tokens,
     merge_properties,
     merge_services,
+    normalize_view_key,
     view_of_device,
 )
 from app.services.node_dedupe import dedupe_nodes_by_device
@@ -77,10 +78,30 @@ def _blank(value: Any) -> bool:
     return value is None or value == ""
 
 
+def _naive(value: datetime | None) -> datetime:
+    """A stored timestamp in a form two rows can be compared in.
+
+    SQLite keeps no offset, so a row read back from the database carries a naive
+    datetime while a row created in this session still holds the tz-aware value
+    ``_now`` gave it — and ``expire_on_commit=False`` means no commit ever
+    reconciles the two. A reconcile pass sorts exactly those two together (a
+    scan is where a row first learns the MAC that proves it a duplicate), so
+    comparing them raw raises ``TypeError: can't compare offset-naive and
+    offset-aware datetimes`` and aborts the merge. Normalise to naive UTC before
+    every comparison. ``datetime.min`` stands in for no timestamp at all, which
+    the column forbids but a hand-edited database could still hold.
+    """
+    if value is None:
+        return datetime.min
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _newest(left: datetime | None, right: datetime | None) -> datetime | None:
     if left is None or right is None:
         return left or right
-    return max(left, right)
+    return max(left, right, key=_naive)
 
 
 def _merged_ip(winner: str | None, loser: str | None) -> str | None:
@@ -169,7 +190,14 @@ async def _show_merged_facts(db: AsyncSession, winner: InventoryDevice) -> int:
                 # No view at all for this list — `apply_view` already shows
                 # everything the row holds, merged facts included.
                 continue
-            listed = {str(e.get("key")) for e in entries if isinstance(e, dict)}
+            # Normalized: a view written before #469 addresses a service by a
+            # key that carries its name, and comparing it raw against a freshly
+            # seeded key would call an already-listed service missing.
+            listed = {
+                normalize_view_key(str(e.get("key")), kind)
+                for e in entries
+                if isinstance(e, dict)
+            }
             missing = [entry for entry in seeds[kind] if entry["key"] not in listed]
             if missing:
                 view[kind] = [*entries, *missing]
@@ -258,10 +286,31 @@ async def _rewrite_links(db: AsyncSession, winner_ieee: str, loser_ieees: list[s
         seen.add(key)
 
 
+def distinct_ieees(rows: list[InventoryDevice]) -> list[str]:
+    """Every distinct non-blank IEEE carried by ``rows``, first spelling wins.
+
+    ``ieee_address`` is UNIQUE and is what every other writer comes back to —
+    the import matches on it before anything else, the mesh links and the
+    Proxmox host→guest graph are keyed on it. A merge has exactly one row left
+    at the end, so it has room for exactly one of these: any group holding two
+    is a group that cannot be collapsed without destroying an identity. Callers
+    use this to refuse the collapse; :func:`merge_devices` uses it to say what
+    it dropped when the user asked for it anyway.
+    """
+    out: dict[str, str] = {}
+    for row in rows:
+        ieee = row.ieee_address
+        if ieee and not _blank(ieee):
+            out.setdefault(ieee.lower(), ieee)
+    return list(out.values())
+
+
 async def merge_devices(
     db: AsyncSession,
     winner: InventoryDevice,
     losers: list[InventoryDevice],
+    *,
+    dedupe_nodes: bool = True,
 ) -> dict[str, Any]:
     """Fold ``losers`` into ``winner``. Does not commit — the caller owns that.
 
@@ -281,12 +330,13 @@ async def merge_devices(
             "nodes_repointed": 0,
             "documents_orphaned": 0,
             "views_extended": 0,
+            "ieee_dropped": [],
         }
 
     loser_ids = [row.id for row in losers]
     # Oldest first: where two losers both fill the same gap, the older sighting
     # is the one that has survived longest without being contradicted.
-    for loser in sorted(losers, key=lambda d: (d.discovered_at, d.id)):
+    for loser in sorted(losers, key=lambda d: (_naive(d.discovered_at), d.id)):
         for field in _FILL_SCALARS:
             if _blank(getattr(winner, field, None)):
                 value = getattr(loser, field, None)
@@ -294,7 +344,14 @@ async def merge_devices(
                     setattr(winner, field, value)
         winner.ip = _merged_ip(winner.ip, loser.ip)
         winner.mac = winner.mac or loser.mac
-        winner.services = merge_services(winner.services, loser.services)
+        # discovered=: the winner is the row the canvas points at (an approved
+        # row wins `_collapse_targets`), and a loser is usually a pending row a
+        # scan just minted, carrying the fingerprint's guess at a name. Both
+        # rows describe one device, so two entries on one port are one service
+        # — and the curated side of it is the winner's. Without this the guess
+        # would overwrite a name, icon or category the user had chosen, in a
+        # collapse that runs unattended during a background scan.
+        winner.services = merge_services(winner.services, loser.services, discovered=True)
         winner.properties = merge_properties(winner.properties, loser.properties)
         winner.show_hardware = winner.show_hardware or loser.show_hardware
         for source in add_source(loser.discovery_sources, loser.discovery_source):
@@ -305,7 +362,7 @@ async def merge_devices(
         winner.last_scan = _newest(winner.last_scan, loser.last_scan)
         # The device has been known since the earliest of the rows saw it.
         if loser.discovered_at and winner.discovered_at:
-            winner.discovered_at = min(winner.discovered_at, loser.discovered_at)
+            winner.discovered_at = min(winner.discovered_at, loser.discovered_at, key=_naive)
 
     winner.status = _merged_status(winner.status, losers)
 
@@ -324,6 +381,27 @@ async def merge_devices(
         # holding it is gone — assigned after the delete below.
         adopted = loser_ieees[0]
 
+    # One row survives, so it can hold one IEEE. Every other distinct address in
+    # the group goes with the row that carried it, and whatever keys on it — a
+    # Proxmox import, a re-scan, a mesh writer — stops finding this device and
+    # mints a fresh duplicate instead. The automatic passes refuse such a group
+    # outright (`_group_candidates`, the scanner's `_collapse_targets`); reaching
+    # here means the user asked for it by hand, so it is allowed and recorded
+    # rather than vetoed. The mesh links themselves survive: `_rewrite_links`
+    # moves them onto the survivor's address below.
+    kept_ieee = adopted or winner.ieee_address
+    kept_key = kept_ieee.lower() if kept_ieee else None
+    ieee_dropped = [
+        ieee for ieee in distinct_ieees([winner, *losers]) if ieee.lower() != kept_key
+    ]
+    if ieee_dropped:
+        logger.warning(
+            "Inventory merge: %s keeps %s and drops %d other IEEE address(es) — "
+            "anything keying on %s will no longer find this device (%s)",
+            winner.id, kept_ieee or "no IEEE", len(ieee_dropped),
+            ", ".join(ieee_dropped), winner.label or winner.friendly_name or winner.ip,
+        )
+
     for loser in losers:
         await db.delete(loser)
     await db.flush()
@@ -335,9 +413,11 @@ async def merge_devices(
         await _rewrite_links(db, winner.ieee_address, loser_ieees)
 
     # Two nodes on one canvas may now draw the survivor — that is exactly the
-    # same-design duplicate the node repair collapses.
-    await dedupe_nodes_by_device(db)
-    await db.flush()
+    # same-design duplicate the node repair collapses. Batch callers set
+    # dedupe_nodes=False and run dedupe_nodes_by_device once after all merges.
+    if dedupe_nodes:
+        await dedupe_nodes_by_device(db)
+        await db.flush()
 
     logger.info(
         "Inventory merge: %d row(s) folded into %s (%s)",
@@ -349,6 +429,7 @@ async def merge_devices(
         "nodes_repointed": nodes.rowcount or 0,
         "documents_orphaned": orphaned,
         "views_extended": shown,
+        "ieee_dropped": ieee_dropped,
     }
 
 
@@ -378,7 +459,7 @@ def _pick_winner(group: list[InventoryDevice]) -> InventoryDevice:
         key=lambda d: (
             0 if d.ieee_address else 1,
             0 if d.status == "approved" else 1,
-            d.discovered_at,
+            _naive(d.discovered_at),
             d.id,
         ),
     )[0]
@@ -442,6 +523,11 @@ async def reconcile_duplicates(db: AsyncSession) -> int:
     merged = 0
     for group in _auto_groups(list(rows)):
         winner = _pick_winner(group)
-        result = await merge_devices(db, winner, [row for row in group if row is not winner])
+        result = await merge_devices(
+            db, winner, [row for row in group if row is not winner], dedupe_nodes=False
+        )
         merged += int(result["merged"])
+    if merged:
+        await dedupe_nodes_by_device(db)
+        await db.flush()
     return merged

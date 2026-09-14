@@ -17,13 +17,13 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.db.database import get_db
-from app.db.models import Document, DocumentRevision, Edge, InventoryDevice, Node, Rack, RackDevice
+from app.db.models import Design, Document, DocumentRevision, Edge, InventoryDevice, Node, Rack, RackDevice
 from app.schemas.documents import (
     BacklinkHit,
     CoverageResponse,
@@ -39,6 +39,7 @@ from app.schemas.documents import (
     SearchResponse,
 )
 from app.services import doc_backlinks, doc_search
+from app.services.doc_export import ExportDoc, build_zip
 from app.services.doc_template import (
     BLOCKS,
     TEMPLATE_DEVICE,
@@ -59,9 +60,12 @@ from app.services.doc_tree import (
 
 router = APIRouter()
 
-# Node.type values that are canvas furniture. A zone or a group is documented
-# through its node; everything else is documented through its device.
-_FURNITURE_TYPES = {"group", "groupRect", "text"}
+# The furniture a device can sit *in*, and so be located by. Deliberately not
+# `inventory_sync.FURNITURE_TYPES`, which answers a different question: a `text`
+# annotation is furniture — it draws no device — but it is a caption, not a
+# place, and its content is nobody's zone name (#446). A device parented in one
+# keeps walking up to the zone that really holds it, if there is one.
+_ZONE_TYPES = {"group", "groupRect"}
 
 _INTERVAL = re.compile(r"^\s*(\d+)\s*([dwmy])\s*$", re.IGNORECASE)
 _INTERVAL_DAYS = {"d": 1, "w": 7, "m": 30, "y": 365}
@@ -149,7 +153,7 @@ async def _device_context(db: AsyncSession, device_id: str) -> dict[str, Any]:
             parent = await db.get(Node, parent_id)
             if parent is None:
                 break
-            if parent.type in _FURNITURE_TYPES:
+            if parent.type in _ZONE_TYPES:
                 context["zone_label"] = parent.label
                 break
             parent_id = parent.parent_id
@@ -349,6 +353,42 @@ async def generated_block(
     return {"block": block, "markdown": render_block(block, device, **context)}
 
 
+@router.get("/export")
+async def export_documents(
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(get_current_user),
+) -> Response:
+    """Every document as a zip of `.md` files mirroring the tree.
+
+    Declared above `/{document_id}` so "export" is not read as an id.
+    """
+    docs = (await db.execute(select(Document))).scalars().all()
+    archive = build_zip(
+        [
+            ExportDoc(
+                id=doc.id,
+                kind=doc.kind,
+                title=doc.title,
+                slug=doc.slug,
+                parent_id=doc.parent_id,
+                body=doc.body or "",
+            )
+            for doc in docs
+        ]
+    )
+    filename = f"homelable-documentation-{_now():%Y%m%d}.zip"
+    return Response(
+        content=archive,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # The browser reads the name from the header, and a cross-origin
+            # fetch cannot see it unless it is exposed.
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
+
+
 @router.get("/{document_id}", response_model=DocumentResponse)
 async def get_document(
     document_id: str,
@@ -480,6 +520,7 @@ async def create_document(
     for link, model, what in (
         (body.device_id, InventoryDevice, "Device"),
         (body.node_id, Node, "Node"),
+        (body.design_id, Design, "Design"),
     ):
         if link and not await db.get(model, link):
             raise HTTPException(404, f"{what} not found")

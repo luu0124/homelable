@@ -8,6 +8,7 @@ that never saw them.
 """
 
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -21,7 +22,13 @@ from app.db.models import (
     Rack,
     RackDevice,
 )
-from app.services.device_merge import merge_devices, reconcile_duplicates
+from app.services.device_merge import (
+    _naive,
+    _newest,
+    distinct_ieees,
+    merge_devices,
+    reconcile_duplicates,
+)
 
 
 def _at(day: int) -> datetime:
@@ -156,7 +163,10 @@ async def test_merge_shows_the_new_facts_on_a_canvas_that_never_saw_them(db_sess
 
     services = poor.display_view["services"]
     assert [e["visible"] for e in services] == [True, True]
-    assert {e["key"] for e in services} == {"5678|tcp|http", "22|tcp|ssh"}
+    # The pre-existing entry is kept exactly as it was stored — a view is
+    # rewritten by a save, not by a merge — so the key seeded alongside it is
+    # in today's port-keyed form while that one stays in the older one.
+    assert {e["key"] for e in services} == {"5678|tcp|http", "22|tcp"}
     # A property list this canvas had never seen picks up the survivor's.
     assert [e["key"] for e in poor.display_view["properties"]] == ["vmid"]
 
@@ -286,6 +296,69 @@ async def test_the_survivor_adopts_an_ieee_it_lacks(db_session):
 
 
 @pytest.mark.asyncio
+async def test_the_survivor_adopts_the_first_ieee_and_reports_the_rest(db_session):
+    """Regression for #453: a merge has room for one IEEE, so say what it drops.
+
+    Two losers carrying distinct addresses collapse onto an IEEE-less survivor.
+    Only the first can be adopted — `ieee_address` is UNIQUE — and the second
+    goes with the row that held it. The automatic passes refuse such a group
+    outright; a hand merge is allowed to do it, but never silently.
+    """
+    winner = await _device(db_session, id="w", ip="192.168.1.62", ieee_address=None)
+    first = await _device(db_session, id="a", ieee_address="0xAABB", discovered_at=_at(1))
+    second = await _device(db_session, id="b", ieee_address="0xCCDD", discovered_at=_at(2))
+
+    result = await merge_devices(db_session, winner, [first, second])
+    await db_session.flush()
+
+    assert winner.ieee_address == "0xAABB"
+    assert result["ieee_dropped"] == ["0xCCDD"]
+
+
+@pytest.mark.asyncio
+async def test_an_ieee_the_survivor_already_holds_is_not_reported_as_dropped(db_session):
+    winner = await _device(db_session, id="w", ieee_address="0xAABB", ip="192.168.1.62")
+    loser = await _device(db_session, id="l", ieee_address="0xaabb".upper(), ip="192.168.1.62")
+
+    result = await merge_devices(db_session, winner, [loser])
+
+    assert result["ieee_dropped"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_losers_ieee_is_reported_when_the_survivor_holds_its_own(db_session):
+    """The survivor keeps what it has, so a different address on a loser is lost."""
+    winner = await _device(db_session, id="w", ieee_address="pve-pve1-130", ip="192.168.1.62")
+    loser = await _device(db_session, id="l", ieee_address="0xCCDD", ip="192.168.1.62")
+
+    result = await merge_devices(db_session, winner, [loser])
+
+    assert result["ieee_dropped"] == ["0xCCDD"]
+
+
+@pytest.mark.asyncio
+async def test_a_merge_that_loses_no_address_reports_nothing(db_session):
+    winner = await _device(db_session, id="w", ip="192.168.1.62", ieee_address=None)
+    loser = await _device(db_session, id="l", ip="192.168.1.62", ieee_address=None)
+
+    result = await merge_devices(db_session, winner, [loser])
+
+    assert result["ieee_dropped"] == []
+
+
+def test_distinct_ieees_folds_case_and_keeps_the_first_spelling():
+    rows = [
+        InventoryDevice(id="a", ieee_address="0xAABB"),
+        InventoryDevice(id="b", ieee_address="0xaabb"),
+        InventoryDevice(id="c", ieee_address=None),
+        InventoryDevice(id="d", ieee_address=""),
+        InventoryDevice(id="e", ieee_address="0xCCDD"),
+    ]
+
+    assert distinct_ieees(rows) == ["0xAABB", "0xCCDD"]
+
+
+@pytest.mark.asyncio
 async def test_reconcile_merges_rows_sharing_a_mac(db_session):
     """The reported case: a Proxmox row and a canvas row, same NIC."""
     scanned = await _device(
@@ -347,6 +420,84 @@ async def test_reconcile_is_idempotent(db_session):
     assert await reconcile_duplicates(db_session) == 0
 
 
+# --- Regression: mixed tz-awareness on discovered_at (#440) --------------
+#
+# Every other test in this file builds both rows in one session, so both carry
+# the tz-aware value the column default gave them and every comparison is
+# naive-vs-naive or aware-vs-aware. Production is not like that: SQLite stores
+# no offset, so a row read back is naive, while a row this session just created
+# is aware — and `expire_on_commit=False` means no commit reconciles them.
+# `expire_all` reproduces that split, which is the state a scan reconcile runs
+# in: it is where a row first learns the MAC that proves it a duplicate.
+
+
+async def _stored(db, **kwargs):
+    """A row as it comes back from the database — naive, offset dropped."""
+    device = await _device(db, **kwargs)
+    await db.flush()
+    db.expire_all()
+    await db.refresh(device)
+    return device
+
+
+@pytest.mark.asyncio
+async def test_merge_devices_compares_stored_and_session_timestamps(db_session):
+    """A loser read from the database must sort against a winner created here."""
+    stored = await _stored(db_session, id="l", ip="10.0.0.2", mac="aa:bb:cc:dd:ee:02")
+    assert stored.discovered_at.tzinfo is None, "row from the database should be naive"
+    winner = InventoryDevice(id="w", ip="10.0.0.1", mac="aa:bb:cc:dd:ee:01")
+    db_session.add(winner)
+    await db_session.flush()
+    assert winner.discovered_at.tzinfo is not None, "row made here should be tz-aware"
+
+    result = await merge_devices(db_session, winner, [stored])
+    assert result["merged"] == 1
+    # The survivor keeps the earlier sighting, whichever form it was stored in.
+    assert _naive(winner.discovered_at) == _naive(stored.discovered_at)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_compares_stored_and_session_timestamps(db_session):
+    """A scan reconcile folds a row it just made into one already on disk."""
+    await _stored(db_session, id="a", mac="aa:bb:cc:dd:ee:ff")
+    fresh = InventoryDevice(id="b", mac="aa:bb:cc:dd:ee:ff")
+    db_session.add(fresh)
+    await db_session.flush()
+
+    assert await reconcile_duplicates(db_session) == 1
+
+
+@pytest.mark.asyncio
+async def test_newest_compares_stored_and_session_timestamps():
+    """`last_seen`/`last_scan` carry the same split — scanner writes them aware."""
+    stored = datetime(2026, 1, 2)
+    fresh = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert _newest(stored, fresh) is stored
+    assert _newest(fresh, stored) is stored
+
+
+# --- Regression: dedupe called once per reconcile batch ------------------
+
+
+@pytest.mark.asyncio
+async def test_reconcile_calls_dedupe_nodes_once_regardless_of_group_count(db_session):
+    """dedupe_nodes_by_device must be called exactly once even with N merge groups."""
+    for i in range(3):
+        mac = f"aa:bb:cc:dd:ee:{i:02x}"
+        await _device(db_session, id=f"a{i}", mac=mac, discovered_at=_at(1))
+        await _device(db_session, id=f"b{i}", mac=mac, discovered_at=_at(2))
+
+    with patch(
+        "app.services.device_merge.dedupe_nodes_by_device", new_callable=AsyncMock
+    ) as mock_dedupe:
+        merged = await reconcile_duplicates(db_session)
+
+    assert merged == 3
+    assert mock_dedupe.call_count == 1, (
+        f"dedupe_nodes_by_device called {mock_dedupe.call_count} times; expected 1"
+    )
+
+
 # --- The route -----------------------------------------------------------
 
 
@@ -403,3 +554,74 @@ async def test_merge_route_requires_auth(client, db_session):
         "/api/v1/scan/pending/merge", json={"winner_id": "w", "loser_ids": ["l"]}
     )
     assert res.status_code in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_a_merge_keeps_the_survivor_name_for_a_service_on_the_same_port(db_session):
+    """Two rows describing one device describe one service per port.
+
+    The winner is the row the canvas points at, and a loser is usually a pending
+    row a scan minted, carrying the fingerprint's guess. Collapsing the pair must
+    not let that guess overwrite the name, icon and category the user curated —
+    the collapse runs unattended during a background scan.
+    """
+    winner = await _device(
+        db_session, id="w", ip="192.168.1.62",
+        services=[{
+            "port": 80, "protocol": "tcp", "service_name": "Homepage",
+            "icon": "brand:homepage", "category": "monitoring",
+        }],
+    )
+    loser = await _device(
+        db_session, id="l", ip="192.168.1.62",
+        services=[{
+            "port": 80, "protocol": "tcp", "service_name": "nginx",
+            "icon": "Globe", "category": "web", "path": "/dash",
+        }],
+    )
+
+    await merge_devices(db_session, winner, [loser])
+    await db_session.flush()
+
+    assert len(winner.services) == 1
+    assert winner.services[0]["service_name"] == "Homepage"
+    assert winner.services[0]["icon"] == "brand:homepage"
+    assert winner.services[0]["category"] == "monitoring"
+    # Everything that is not the user's call still comes across.
+    assert winner.services[0]["path"] == "/dash"
+
+
+@pytest.mark.asyncio
+async def test_a_merge_still_takes_a_service_the_survivor_never_had(db_session):
+    """Curating the collision must not stop the union doing its job."""
+    winner = await _device(
+        db_session, id="w", ip="192.168.1.62",
+        services=[{"port": 80, "protocol": "tcp", "service_name": "Homepage"}],
+    )
+    loser = await _device(
+        db_session, id="l", ip="192.168.1.62",
+        services=[{"port": 5678, "protocol": "tcp", "service_name": "n8n"}],
+    )
+
+    await merge_devices(db_session, winner, [loser])
+    await db_session.flush()
+
+    assert [s["service_name"] for s in winner.services] == ["Homepage", "n8n"]
+
+
+@pytest.mark.asyncio
+async def test_a_merge_names_a_service_the_survivor_left_unnamed(db_session):
+    """A blank name is silence, so the loser's fills it rather than being dropped."""
+    winner = await _device(
+        db_session, id="w", ip="192.168.1.62",
+        services=[{"port": 80, "protocol": "tcp"}],
+    )
+    loser = await _device(
+        db_session, id="l", ip="192.168.1.62",
+        services=[{"port": 80, "protocol": "tcp", "service_name": "nginx"}],
+    )
+
+    await merge_devices(db_session, winner, [loser])
+    await db_session.flush()
+
+    assert [s["service_name"] for s in winner.services] == ["nginx"]
