@@ -13,6 +13,11 @@ from app.services.doc_tree import DOCUMENT_KINDS
 # user asks (by zone, subnet, type…) without the server storing a tree.
 DOC_KINDS = set(DOCUMENT_KINDS)
 
+# The reasons a caller may put its own name to. Everything else a revision can
+# say — "restore", "regenerate", "scaffold", "migrate" — belongs to the action
+# that takes it, so no client can dress a plain edit up as one of those.
+CLIENT_REVISION_REASONS = frozenset({"edit", "mcp", "import"})
+
 
 class DocumentCreate(BaseModel):
     kind: str = "page"
@@ -55,6 +60,17 @@ class DocumentUpdate(BaseModel):
     # Accept the device's current facts as documented, clearing the drift
     # banner without touching the body.
     resync_facts: bool | None = None
+    # What the history should say caused this edit. Only read when the body
+    # actually changes — a starred flag or a rename snapshots nothing, so there
+    # is no revision to attribute. Defaults to "edit", the human in the editor.
+    revision_reason: str | None = None
+
+    @field_validator("revision_reason")
+    @classmethod
+    def _known_reason(cls, v: str | None) -> str | None:
+        if v is not None and v not in CLIENT_REVISION_REASONS:
+            raise ValueError(f"revision_reason must be one of {sorted(CLIENT_REVISION_REASONS)}")
+        return v
 
 
 class DocumentSummary(BaseModel):
@@ -110,6 +126,62 @@ class RevisionSummary(BaseModel):
 
 
 class RevisionResponse(RevisionSummary):
+    body: str = ""
+
+
+# ── Public (documentation view) ─────────────────────────────────────────────
+# What DOCS_VIEW_KEY opens to anyone holding the URL.
+#
+# Written out field by field rather than subclassed from the models above, and
+# that is the whole point: inheriting would enrol every field added to
+# `DocumentSummary` later into the public payload by default. What is missing
+# here is missing on purpose — `device_id`, `node_id`, `design_id`,
+# `facts_snapshot`, `facts_synced_at`, `drifted` and `template_id` are handles
+# onto inventory and canvas rows this key grants nothing of.
+
+
+class PublicDocumentSummary(BaseModel):
+    """What the public tree needs: placement, naming, badges. Never a body."""
+
+    id: str
+    kind: str
+    title: str
+    slug: str
+    icon: str | None = None
+    parent_id: str | None = None
+    sort_order: int = 0
+    tags: list[str] = []
+    # Parsed out of a body this key already serves, and what the tree badges
+    # "due for review" from — so it carries nothing the reader cannot see.
+    frontmatter: dict[str, Any] = {}
+    starred: bool = False
+    reviewed_at: datetime | None = None
+    edited_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class PublicDocumentResponse(PublicDocumentSummary):
+    body: str = ""
+
+
+class PublicRevisionSummary(BaseModel):
+    """One earlier version, listed. Reading history is a read; restoring is not,
+    and the public router offers no way to take one."""
+
+    id: str
+    document_id: str
+    title: str
+    reason: str
+    saved_at: datetime
+    size: int = 0
+
+    model_config = {"from_attributes": True}
+
+
+class PublicRevisionResponse(PublicRevisionSummary):
     body: str = ""
 
 

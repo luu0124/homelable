@@ -23,9 +23,14 @@ vi.mock('@/api/client', () => ({
     saveConfig: vi.fn(),
     syncNow: vi.fn(),
   },
+  unifiApi: {
+    getConfig: vi.fn(),
+    saveConfig: vi.fn(),
+    syncNow: vi.fn(),
+  },
 }))
 
-import { settingsApi, proxmoxApi, zigbeeApi, zwaveApi } from '@/api/client'
+import { settingsApi, proxmoxApi, zigbeeApi, zwaveApi, unifiApi } from '@/api/client'
 import { toast } from 'sonner'
 import { useCanvasStore } from '@/stores/canvasStore'
 
@@ -44,6 +49,9 @@ describe('SettingsModal', () => {
     vi.mocked(zwaveApi.getConfig).mockRejectedValue(new Error('not configured'))
     vi.mocked(zwaveApi.saveConfig).mockResolvedValue({ data: {} } as never)
     vi.mocked(zwaveApi.syncNow).mockResolvedValue({ data: { status: 'running' } } as never)
+    vi.mocked(unifiApi.getConfig).mockRejectedValue(new Error('not configured'))
+    vi.mocked(unifiApi.saveConfig).mockResolvedValue({ data: {} } as never)
+    vi.mocked(unifiApi.syncNow).mockResolvedValue({ data: { infra_count: 4, client_count: 1 } } as never)
     vi.mocked(toast.success).mockReset()
     vi.mocked(toast.error).mockReset()
   })
@@ -211,5 +219,146 @@ describe('SettingsModal', () => {
     await screen.findByDisplayValue('60')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(onClose).toHaveBeenCalledOnce()
+  })
+})
+
+describe('SettingsModal — UniFi', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(settingsApi.get).mockResolvedValue({ data: { interval_seconds: 60, service_check_enabled: false, service_check_interval: 300 } } as never)
+    vi.mocked(settingsApi.save).mockResolvedValue({ data: {} } as never)
+    vi.mocked(proxmoxApi.getConfig).mockRejectedValue(new Error('not configured'))
+    vi.mocked(zigbeeApi.getConfig).mockRejectedValue(new Error('not configured'))
+    vi.mocked(zwaveApi.getConfig).mockRejectedValue(new Error('not configured'))
+    vi.mocked(unifiApi.saveConfig).mockResolvedValue({ data: {} } as never)
+    vi.mocked(unifiApi.syncNow).mockResolvedValue({ data: { infra_count: 4, client_count: 1 } } as never)
+    vi.mocked(toast.success).mockReset()
+    vi.mocked(toast.error).mockReset()
+  })
+
+  const config = (over = {}) => ({
+    data: {
+      host: 'unifi.local', port: 8443, site: 'default', verify_tls: false,
+      sync_enabled: false, sync_interval: 3600, credentials_configured: true,
+      modes: { infrastructure: true, known_clients: false, active_clients: false },
+      ...over,
+    },
+  })
+
+  it('stays hidden when the controller is not configured', async () => {
+    vi.mocked(unifiApi.getConfig).mockRejectedValue(new Error('not configured'))
+    render(<SettingsModal open onClose={vi.fn()} />)
+    await waitFor(() => expect(unifiApi.getConfig).toHaveBeenCalled())
+    expect(screen.queryByText('UniFi auto-sync')).not.toBeInTheDocument()
+  })
+
+  it('asks for credentials instead of the toggle when none are set', async () => {
+    vi.mocked(unifiApi.getConfig).mockResolvedValue(config({ credentials_configured: false }) as never)
+    render(<SettingsModal open onClose={vi.fn()} />)
+    await waitFor(() => expect(screen.getByText('UniFi auto-sync')).toBeInTheDocument())
+    expect(screen.getByText(/UNIFI_USER/)).toBeInTheDocument()
+    expect(screen.queryByLabelText('Toggle UniFi auto-sync')).not.toBeInTheDocument()
+  })
+
+  it('persists the import modes the user ticked', async () => {
+    vi.mocked(unifiApi.getConfig).mockResolvedValue(config() as never)
+    render(<SettingsModal open onClose={vi.fn()} />)
+    await waitFor(() => expect(screen.getByText('UniFi auto-sync')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByLabelText('Import Known clients'))
+    fireEvent.click(screen.getByLabelText('Toggle UniFi auto-sync'))
+    fireEvent.click(screen.getByRole('button', { name: /save/i }))
+
+    await waitFor(() => expect(unifiApi.saveConfig).toHaveBeenCalled())
+    expect(vi.mocked(unifiApi.saveConfig).mock.calls[0][0]).toEqual({
+      sync_enabled: true,
+      sync_interval: 3600,
+      modes: { infrastructure: true, known_clients: true, active_clients: false },
+    })
+  })
+
+  it('reflects the modes the server already had', async () => {
+    vi.mocked(unifiApi.getConfig).mockResolvedValue(
+      config({ modes: { infrastructure: false, known_clients: true, active_clients: true } }) as never,
+    )
+    render(<SettingsModal open onClose={vi.fn()} />)
+    await waitFor(() => expect(screen.getByText('UniFi auto-sync')).toBeInTheDocument())
+
+    expect(screen.getByLabelText('Import Infrastructure')).not.toBeChecked()
+    expect(screen.getByLabelText('Import Known clients')).toBeChecked()
+    expect(screen.getByLabelText('Import Active clients')).toBeChecked()
+  })
+
+  it('blocks Re-sync now when no source is selected', async () => {
+    vi.mocked(unifiApi.getConfig).mockResolvedValue(config() as never)
+    render(<SettingsModal open onClose={vi.fn()} />)
+    await waitFor(() => expect(screen.getByText('UniFi auto-sync')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByLabelText('Import Infrastructure'))
+
+    expect(screen.getByRole('button', { name: /re-sync now/i })).toBeDisabled()
+    expect(screen.getByText(/select at least one source/i)).toBeInTheDocument()
+  })
+
+  it('blocks Save when no source is selected, so nothing partially persists', async () => {
+    vi.mocked(unifiApi.getConfig).mockResolvedValue(config() as never)
+    render(<SettingsModal open onClose={vi.fn()} />)
+    await waitFor(() => expect(screen.getByText('UniFi auto-sync')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByLabelText('Import Infrastructure'))
+
+    const save = screen.getByRole('button', { name: /save/i })
+    expect(save).toBeDisabled()
+    fireEvent.click(save)
+    // Before the fix the status-check config saved, then UniFi 422'd and the
+    // user got a cause-less "Failed to save settings".
+    expect(settingsApi.save).not.toHaveBeenCalled()
+    expect(unifiApi.saveConfig).not.toHaveBeenCalled()
+  })
+
+  it('leaves Save enabled when the UniFi panel is absent', async () => {
+    vi.mocked(unifiApi.getConfig).mockRejectedValue(new Error('not configured'))
+    render(<SettingsModal open onClose={vi.fn()} />)
+    await waitFor(() => expect(unifiApi.getConfig).toHaveBeenCalled())
+    expect(screen.getByRole('button', { name: /save/i })).not.toBeDisabled()
+  })
+
+  it('clamps a typed sync interval below the backend minimum', async () => {
+    vi.mocked(unifiApi.getConfig).mockResolvedValue(config() as never)
+    render(<SettingsModal open onClose={vi.fn()} />)
+    await waitFor(() => expect(screen.getByText('UniFi auto-sync')).toBeInTheDocument())
+
+    // min={300} on the input never stopped a typed value; the backend's
+    // sync_interval ge=300 would 422 and abort the whole save.
+    fireEvent.change(screen.getByLabelText('UniFi sync interval'), { target: { value: '100' } })
+    fireEvent.click(screen.getByRole('button', { name: /save/i }))
+
+    await waitFor(() => expect(unifiApi.saveConfig).toHaveBeenCalled())
+    expect(vi.mocked(unifiApi.saveConfig).mock.calls[0][0].sync_interval).toBe(300)
+  })
+
+  it('clamps a typed sync interval above the backend maximum', async () => {
+    vi.mocked(unifiApi.getConfig).mockResolvedValue(config() as never)
+    render(<SettingsModal open onClose={vi.fn()} />)
+    await waitFor(() => expect(screen.getByText('UniFi auto-sync')).toBeInTheDocument())
+
+    fireEvent.change(screen.getByLabelText('UniFi sync interval'), { target: { value: '999999' } })
+    fireEvent.click(screen.getByRole('button', { name: /save/i }))
+
+    await waitFor(() => expect(unifiApi.saveConfig).toHaveBeenCalled())
+    expect(vi.mocked(unifiApi.saveConfig).mock.calls[0][0].sync_interval).toBe(86400)
+  })
+
+  it('reports what a manual re-sync imported', async () => {
+    vi.mocked(unifiApi.getConfig).mockResolvedValue(config() as never)
+    render(<SettingsModal open onClose={vi.fn()} />)
+    await waitFor(() => expect(screen.getByText('UniFi auto-sync')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: /re-sync now/i }))
+
+    await waitFor(() => expect(unifiApi.syncNow).toHaveBeenCalledOnce())
+    expect(toast.success).toHaveBeenCalledWith(
+      expect.stringContaining('4 device(s), 1 client(s)'),
+    )
   })
 })

@@ -102,6 +102,32 @@ export const liveviewApi = {
   getConfig: () => api.get<{ enabled: boolean; key: string | null }>('/liveview/config'),
 }
 
+/**
+ * The read-only documentation space at `/docs?key=…`.
+ *
+ * On `publicApi`, like live view: no JWT rides along, and a 401 must not bounce
+ * a reader towards a login they do not have. Reads only — the public router
+ * declares no write for this to call.
+ */
+export const docsviewApi = {
+  tree: (key: string) =>
+    publicApi.get<import('@/documentation/types').DocumentSummary[]>('/docsview/tree', {
+      params: { key },
+    }),
+  get: (key: string, id: string) =>
+    publicApi.get<import('@/documentation/types').Doc>(`/docsview/${id}`, { params: { key } }),
+  revisions: (key: string, id: string) =>
+    publicApi.get<import('@/documentation/types').DocRevision[]>(`/docsview/${id}/revisions`, {
+      params: { key },
+    }),
+  revision: (key: string, revisionId: string) =>
+    publicApi.get<import('@/documentation/types').DocRevision & { body: string }>(
+      `/docsview/revisions/${revisionId}`,
+      { params: { key } },
+    ),
+  getConfig: () => api.get<{ enabled: boolean; key: string | null }>('/docsview/config'),
+}
+
 export interface DeepScanConfig {
   http_ranges: string[]
   http_probe_enabled: boolean
@@ -198,7 +224,7 @@ export const scanApi = {
       approved: boolean
       node_id: string
       edges_created: number
-      edges: { id: string; source: string; target: string; type?: string; source_handle?: string | null; target_handle?: string | null }[]
+      edges: { id: string; source: string; target: string; type?: string; source_handle?: string | null; target_handle?: string | null; lqi?: number | null }[]
     }>(`/scan/pending/${id}/approve`, nodeData),
   hide: (id: string) => api.post(`/scan/pending/${id}/hide`),
   ignore: (id: string) => api.post(`/scan/pending/${id}/ignore`),
@@ -208,7 +234,7 @@ export const scanApi = {
       node_ids: string[]
       device_ids: string[]
       edges_created: number
-      edges: { id: string; source: string; target: string; type?: string; source_handle?: string | null; target_handle?: string | null }[]
+      edges: { id: string; source: string; target: string; type?: string; source_handle?: string | null; target_handle?: string | null; lqi?: number | null }[]
       skipped: number
       skipped_devices: SkippedDevice[]
     }>('/scan/pending/bulk-approve', { device_ids: ids, design_id: designId ?? undefined }),
@@ -433,6 +459,7 @@ export const zigbeeApi = {
     base_topic?: string
     mqtt_tls?: boolean
     mqtt_tls_insecure?: boolean
+    include_mesh_links?: boolean
   }) =>
     api.post<{ job_id: string; status: ZigbeeImportJobStatus }>('/zigbee/import', data),
 
@@ -457,6 +484,7 @@ export const zigbeeApi = {
     base_topic?: string
     mqtt_tls?: boolean
     mqtt_tls_insecure?: boolean
+    include_mesh_links?: boolean
   }) =>
     api.post<{
       id: string
@@ -531,4 +559,64 @@ export const zwaveApi = {
   saveConfig: (data: { sync_enabled: boolean; sync_interval: number }) =>
     api.post<ZwaveConfigData>('/zwave/config', data),
   syncNow: () => api.post<ScanRunResult>('/zwave/sync-now'),
+}
+
+export interface UnifiImportModes {
+  infrastructure: boolean
+  known_clients: boolean
+  active_clients: boolean
+}
+
+export interface UnifiConnection {
+  host: string
+  port: number
+  site: string
+  username?: string
+  password?: string
+  verify_tls?: boolean
+  modes?: UnifiImportModes
+}
+
+export interface UnifiConfigData {
+  host: string
+  port: number
+  site: string
+  verify_tls: boolean
+  sync_enabled: boolean
+  sync_interval: number
+  credentials_configured: boolean
+  modes: UnifiImportModes
+}
+
+export interface UnifiImportResult {
+  device_count: number
+  pending_created: number
+  pending_updated: number
+  infra_count: number
+  client_count: number
+}
+
+export const unifiApi = {
+  // `counts` holds a row count per source queried, so the import UI can show
+  // what a box would pull in before it is ticked.
+  testConnection: (data: UnifiConnection) =>
+    api.post<{
+      connected: boolean
+      message: string
+      counts: Partial<Record<keyof UnifiImportModes, number>>
+    }>('/unifi/test-connection', data),
+
+  importToPending: (data: UnifiConnection) =>
+    api.post<UnifiImportResult>('/unifi/import-pending', data),
+
+  getConfig: () => api.get<UnifiConfigData>('/unifi/config'),
+  // Only auto-sync activation and the import modes are persisted. Connection
+  // config (host/port/credentials/site) is env-only and never sent.
+  saveConfig: (data: {
+    sync_enabled: boolean
+    sync_interval: number
+    modes: UnifiImportModes
+  }) => api.post<UnifiConfigData>('/unifi/config', data),
+
+  syncNow: () => api.post<UnifiImportResult>('/unifi/sync-now'),
 }

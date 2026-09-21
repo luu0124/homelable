@@ -12,6 +12,7 @@ from app.api.routes import (
     auth,
     canvas,
     designs,
+    docsview,
     documents,
     edges,
     liveview,
@@ -22,11 +23,12 @@ from app.api.routes import (
     scan,
     stats,
     status,
+    unifi,
     zigbee,
     zwave,
 )
 from app.api.routes import settings as settings_routes
-from app.core.config import settings
+from app.core.config import APP_VERSION, settings
 from app.core.scheduler import start_scheduler, stop_scheduler
 from app.core.security import OIDCCSRFMiddleware
 from app.db.database import AsyncSessionLocal, init_db
@@ -58,7 +60,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(
     title="Homelable API",
-    version="1.9.0",
+    # Read from the VERSION file, never hard-coded: a literal here froze at
+    # 1.9.0 in April 2026 — the last value before VERSION took over as the
+    # source of truth — and silently stayed there for ten releases. This is
+    # what the OpenAPI schema and the Swagger UI badge print.
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -92,9 +98,11 @@ app.include_router(liveview.router, prefix="/api/v1/liveview", tags=["liveview"]
 app.include_router(zigbee.router, prefix="/api/v1/zigbee", tags=["zigbee"])
 app.include_router(zwave.router, prefix="/api/v1/zwave", tags=["zwave"])
 app.include_router(proxmox.router, prefix="/api/v1/proxmox", tags=["proxmox"])
+app.include_router(unifi.router, prefix="/api/v1/unifi", tags=["unifi"])
 app.include_router(stats.router, prefix="/api/v1/stats", tags=["stats"])
 app.include_router(media.router, prefix="/api/v1/media", tags=["media"])
 app.include_router(documents.router, prefix="/api/v1/documents", tags=["documents"])
+app.include_router(docsview.router, prefix="/api/v1/docsview", tags=["docsview"])
 
 
 @app.get("/api/v1/health")

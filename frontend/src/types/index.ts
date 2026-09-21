@@ -83,7 +83,7 @@ export type TextPosition =
   | 'bottom-center'
   | 'bottom-right'
 
-export type EdgeType = 'ethernet' | 'wifi' | 'iot' | 'vlan' | 'virtual' | 'cluster' | 'fibre' | 'electrical'
+export type EdgeType = 'ethernet' | 'wifi' | 'iot' | 'zigbee_mesh' | 'vlan' | 'virtual' | 'cluster' | 'fibre' | 'electrical'
 
 export type NodeStatus = 'online' | 'offline' | 'pending' | 'unknown'
 
@@ -291,6 +291,8 @@ export interface EdgeData extends Record<string, unknown> {
   label?: string
   vlan_id?: number
   speed?: string
+  /** Measured Zigbee link quality. Written by the import, never edited by hand. */
+  lqi?: number
   custom_color?: string
   path_style?: EdgePathStyle
   /** Line render style override. Unset = use the edge type's default preset. */
@@ -363,6 +365,7 @@ export const EDGE_TYPE_LABELS: Record<EdgeType, string> = {
   ethernet: 'Ethernet',
   wifi: 'Wi-Fi',
   iot: 'IoT / Zigbee',
+  zigbee_mesh: 'Zigbee Mesh',
   vlan: 'VLAN',
   virtual: 'Virtual',
   cluster: 'Cluster',
@@ -399,6 +402,13 @@ export interface EdgeTypeStyle {
   arrowStart: MarkerShape
   /** Default marker shape at the target end for new edges of this type. */
   arrowEnd: MarkerShape
+  /**
+   * Print the measured LQI on the link, like the label. A view preference, so
+   * it is read live from the custom style rather than copied onto each edge —
+   * no "Apply to existing" needed. Only edges that carry an `lqi` show it, so
+   * it is offered for the types the Zigbee import writes (`iot`, `zigbee_mesh`).
+   */
+  showLqi?: boolean
 }
 
 export interface CustomStyleDef {

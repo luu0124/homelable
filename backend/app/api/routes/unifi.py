@@ -1,0 +1,383 @@
+"""FastAPI router for UniFi Network Controller import + auto-sync config."""
+
+import logging
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import get_current_user
+from app.core.config import settings
+from app.core.scheduler import reschedule_unifi_sync, set_unifi_sync_enabled
+from app.db.database import AsyncSessionLocal, get_db
+from app.db.models import InventoryDevice, ScanRun
+from app.schemas.unifi import (
+    UnifiConfig,
+    UnifiConnectionRequest,
+    UnifiImportModes,
+    UnifiImportResponse,
+    UnifiSyncConfig,
+    UnifiTestConnectionResponse,
+)
+from app.services.discovery_sources import add_source
+from app.services.unifi_service import (
+    SOURCE_CLIENT,
+    SOURCE_INFRA,
+    fetch_unifi_inventory,
+    merge_unifi_properties,
+    test_unifi_connection,
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+_UNIFI_SOURCE = SOURCE_INFRA
+
+
+def _configured_modes() -> UnifiImportModes:
+    """The import modes persisted in scan_config.json, used by the sync paths."""
+    return UnifiImportModes(
+        infrastructure=settings.unifi_import_infrastructure,
+        known_clients=settings.unifi_import_known_clients,
+        active_clients=settings.unifi_import_active_clients,
+    )
+
+
+def _resolve_credentials(payload: UnifiConnectionRequest) -> tuple[str, str]:
+    username = payload.username or settings.unifi_username
+    password = payload.password or settings.unifi_password
+    if not username or not password:
+        raise HTTPException(
+            status_code=400,
+            detail="No UniFi credentials provided and none configured on the server.",
+        )
+    return username, password
+
+
+@router.post("/test-connection", response_model=UnifiTestConnectionResponse)
+async def test_connection_endpoint(
+    payload: UnifiConnectionRequest,
+    _: str = Depends(get_current_user),
+) -> UnifiTestConnectionResponse:
+    username, password = _resolve_credentials(payload)
+    connected, message, counts = await test_unifi_connection(
+        host=payload.host,
+        port=payload.port,
+        site=payload.site,
+        username=username,
+        password=password,
+        verify_tls=payload.verify_tls,
+        known_clients=payload.modes.known_clients,
+        active_clients=payload.modes.active_clients,
+    )
+    return UnifiTestConnectionResponse(connected=connected, message=message, counts=counts)
+
+
+async def _record_run(
+    db: AsyncSession,
+    target: str,
+    started_at: datetime,
+    *,
+    status: str,
+    devices_found: int = 0,
+    error: str | None = None,
+) -> str:
+    """Log a manual UniFi import in Scan History.
+
+    The manual import runs inline rather than as a background job, so unlike
+    every other importer there is no ``running`` row waiting to be finished —
+    the run is written once, already terminal. Without it the import left no
+    trace in the history at all.
+    """
+    run = ScanRun(
+        status=status,
+        kind="unifi",
+        ranges=[target],
+        devices_found=devices_found,
+        started_at=started_at,
+        finished_at=datetime.now(timezone.utc),
+        error=error,
+    )
+    db.add(run)
+    await db.commit()
+    await db.refresh(run)
+    return run.id
+
+
+@router.post("/import-pending", response_model=UnifiImportResponse)
+async def import_unifi_pending(
+    payload: UnifiConnectionRequest,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(get_current_user),
+) -> UnifiImportResponse:
+    """Fetch UniFi inventory and upsert into pending device inventory."""
+    username, password = _resolve_credentials(payload)
+    started_at = datetime.now(timezone.utc)
+    target = f"{payload.host}:{payload.port}"
+    try:
+        devices = await fetch_unifi_inventory(
+            host=payload.host,
+            port=payload.port,
+            site=payload.site,
+            username=username,
+            password=password,
+            verify_tls=payload.verify_tls,
+            infrastructure=payload.modes.infrastructure,
+            known_clients=payload.modes.known_clients,
+            active_clients=payload.modes.active_clients,
+        )
+    except ConnectionError as exc:
+        await _record_run(db, target, started_at, status="error", error=str(exc))
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Unexpected error during UniFi import")
+        await _record_run(
+            db, target, started_at, status="error", error="Unexpected error during UniFi import"
+        )
+        raise HTTPException(status_code=500, detail="Unexpected error during UniFi import") from exc
+
+    result = await _persist_devices(db, devices)
+    await _record_run(db, target, started_at, status="done", devices_found=result.device_count)
+    return result
+
+
+@router.post("/sync-now", response_model=UnifiImportResponse)
+async def sync_unifi_now(
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(get_current_user),
+) -> UnifiImportResponse:
+    if not (settings.unifi_effective_host and settings.unifi_username and settings.unifi_password):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot sync: no UniFi host/credentials configured on the server.",
+        )
+    started_at = datetime.now(timezone.utc)
+    target = f"{settings.unifi_effective_host}:{settings.unifi_effective_port}"
+    try:
+        devices = await fetch_unifi_inventory(
+            host=settings.unifi_effective_host,
+            port=settings.unifi_effective_port,
+            site=settings.unifi_site,
+            username=settings.unifi_username,
+            password=settings.unifi_password,
+            verify_tls=settings.unifi_verify_tls,
+            infrastructure=settings.unifi_import_infrastructure,
+            known_clients=settings.unifi_import_known_clients,
+            active_clients=settings.unifi_import_active_clients,
+        )
+    except Exception as exc:
+        await _record_run(db, target, started_at, status="error", error=str(exc))
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    result = await _persist_devices(db, devices)
+    await _record_run(db, target, started_at, status="done", devices_found=result.device_count)
+    return result
+
+
+@router.get("/config", response_model=UnifiConfig)
+async def get_unifi_config(_: str = Depends(get_current_user)) -> UnifiConfig:
+    return UnifiConfig(
+        host=settings.unifi_effective_host,
+        port=settings.unifi_effective_port,
+        site=settings.unifi_site,
+        verify_tls=settings.unifi_verify_tls,
+        sync_enabled=settings.unifi_sync_enabled,
+        sync_interval=settings.unifi_sync_interval,
+        credentials_configured=bool(settings.unifi_username and settings.unifi_password),
+        modes=_configured_modes(),
+    )
+
+
+@router.post("/config", response_model=UnifiConfig)
+async def save_unifi_config(
+    payload: UnifiSyncConfig,
+    _: str = Depends(get_current_user),
+) -> UnifiConfig:
+    if payload.sync_enabled and not (
+        settings.unifi_effective_host and settings.unifi_username and settings.unifi_password
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot enable auto-sync: no UniFi host/credentials configured in the server env.",
+        )
+    try:
+        settings.unifi_sync_enabled = payload.sync_enabled
+        settings.unifi_sync_interval = payload.sync_interval
+        settings.unifi_import_infrastructure = payload.modes.infrastructure
+        settings.unifi_import_known_clients = payload.modes.known_clients
+        settings.unifi_import_active_clients = payload.modes.active_clients
+        settings.save_overrides()
+        set_unifi_sync_enabled(payload.sync_enabled)
+        if payload.sync_enabled:
+            reschedule_unifi_sync(payload.sync_interval)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return await get_unifi_config()
+
+
+async def _find_existing(
+    db: AsyncSession, ieee: str, mac: str | None
+) -> InventoryDevice | None:
+    """The inventory row this UniFi record *is*, in precedence order.
+
+    1. The synthetic ``unifi-{mac}`` ieee, for a row a previous import created.
+    2. Else the MAC. A MAC is an identity — the same rule the Proxmox import
+       states — so it matches a row another source already claimed, which is
+       the point: a container found by an IP scan and by Proxmox, then reported
+       by the controller as a client, is one machine and must stay one row.
+
+    Restricting the MAC match to rows with no ieee_address, as this did, filed
+    every such machine twice, because the Proxmox import gives its rows a
+    ``pve-…`` ieee. It guarded against nothing: the mesh imports never set
+    ``mac``, so a MAC match cannot reach a Zigbee or Z-Wave row.
+
+    Oldest row wins, so a re-import is stable when two rows somehow share a MAC.
+    """
+    row = (
+        await db.execute(select(InventoryDevice).where(InventoryDevice.ieee_address == ieee))
+    ).scalars().first()
+    if row is not None:
+        return row
+    if mac:
+        row = (
+            await db.execute(
+                select(InventoryDevice)
+                .where(InventoryDevice.mac == mac)
+                .order_by(InventoryDevice.discovered_at, InventoryDevice.id)
+            )
+        ).scalars().first()
+    return row
+
+
+def _owns(row: InventoryDevice) -> bool:
+    """True when UniFi is the only source that has ever seen this row."""
+    sources = {s for s in (row.discovery_sources or []) if s}
+    return bool(sources) and sources <= {SOURCE_INFRA, SOURCE_CLIENT}
+
+
+async def _persist_devices(
+    db: AsyncSession,
+    devices: list[dict[str, Any]],
+) -> UnifiImportResponse:
+    pending_created = 0
+    pending_updated = 0
+    infra_count = 0
+    client_count = 0
+
+    for dev in devices:
+        ieee = dev.get("ieee_address")
+        if not ieee:
+            continue
+        ip = dev.get("ip")
+        mac = dev.get("mac")
+        source = dev.get("source") or _UNIFI_SOURCE
+        if source == SOURCE_CLIENT:
+            client_count += 1
+        else:
+            infra_count += 1
+
+        existing = await _find_existing(db, ieee, mac)
+
+        if existing is None:
+            row = InventoryDevice(
+                ieee_address=ieee,
+                ip=ip,
+                mac=mac,
+                hostname=dev.get("hostname"),
+                friendly_name=dev.get("label"),
+                suggested_type=dev.get("type"),
+                vendor=dev.get("vendor"),
+                model=dev.get("model"),
+                properties=dev.get("properties", []),
+                status="pending",
+                discovery_source=source,
+                discovery_sources=[source],
+            )
+            db.add(row)
+            pending_created += 1
+        else:
+            existing.discovery_sources = add_source(
+                list(existing.discovery_sources or []),
+                source,
+            )
+            existing.ieee_address = existing.ieee_address or ieee
+            existing.ip = ip or existing.ip
+            existing.mac = existing.mac or mac
+            # Refresh the values, keep the visibility the user chose and any
+            # property they added by hand. A row merged from another source
+            # gains the controller's facts here rather than staying without
+            # them — they were only ever written when the row was created.
+            existing.properties = merge_unifi_properties(
+                list(existing.properties or []),
+                dev.get("properties", []),
+            )
+            # A row another source owns keeps its own description: the
+            # controller knows a client only as a name and a MAC, so letting it
+            # win would retype a Proxmox LXC as a plain "computer" and replace
+            # the hostname the guest reports with the controller's label. On a
+            # row UniFi created, a re-sync is meant to refresh those.
+            if _owns(existing):
+                existing.hostname = dev.get("hostname") or existing.hostname
+                existing.friendly_name = dev.get("label") or existing.friendly_name
+                existing.suggested_type = dev.get("type") or existing.suggested_type
+                existing.vendor = dev.get("vendor") or existing.vendor
+                existing.model = dev.get("model") or existing.model
+            else:
+                existing.hostname = existing.hostname or dev.get("hostname")
+                existing.friendly_name = existing.friendly_name or dev.get("label")
+                existing.suggested_type = existing.suggested_type or dev.get("type")
+                existing.vendor = existing.vendor or dev.get("vendor")
+                existing.model = existing.model or dev.get("model")
+            # Status preserved — an approved device stays approved.
+            # Only reset hidden devices (they came back visible in UniFi).
+            if existing.status == "hidden":
+                existing.status = "pending"
+            pending_updated += 1
+
+    await db.commit()
+    return UnifiImportResponse(
+        device_count=len(devices),
+        pending_created=pending_created,
+        pending_updated=pending_updated,
+        infra_count=infra_count,
+        client_count=client_count,
+    )
+
+
+async def _background_unifi_sync(run_id: str) -> None:
+    async with AsyncSessionLocal() as db:
+        try:
+            devices = await fetch_unifi_inventory(
+                host=settings.unifi_effective_host,
+                port=settings.unifi_effective_port,
+                site=settings.unifi_site,
+                username=settings.unifi_username,
+                password=settings.unifi_password,
+                verify_tls=settings.unifi_verify_tls,
+                infrastructure=settings.unifi_import_infrastructure,
+                known_clients=settings.unifi_import_known_clients,
+                active_clients=settings.unifi_import_active_clients,
+            )
+            result = await _persist_devices(db, devices)
+            run = await db.get(ScanRun, run_id)
+            if run:
+                run.status = "done"
+                run.devices_found = result.device_count
+                run.finished_at = datetime.now(timezone.utc)
+                await db.commit()
+            from app.api.routes.status import broadcast_scan_update
+            await broadcast_scan_update(run_id=run_id, devices_found=result.device_count)
+        except Exception as exc:
+            logger.exception("UniFi sync %s failed", run_id)
+            await db.rollback()
+            run = await db.get(ScanRun, run_id)
+            if run:
+                run.status = "error"
+                run.error = str(exc)[:500]
+                run.finished_at = datetime.now(timezone.utc)
+                await db.commit()

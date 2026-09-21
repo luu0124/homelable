@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/re
 import { Sidebar } from '../Sidebar'
 import { useCanvasStore } from '@/stores/canvasStore'
 import { useAuthStore } from '@/stores/authStore'
+import { scanApi } from '@/api/client'
 import type { Node } from '@xyflow/react'
 import type { NodeData, Design } from '@/types'
 import * as standaloneStorage from '@/utils/standaloneStorage'
@@ -73,8 +74,7 @@ const defaultProps = {
   onAddGroupRect: vi.fn(),
   onAddText: vi.fn(),
   onScan: vi.fn(),
-  onZigbeeImport: vi.fn(),
-  onZwaveImport: vi.fn(),
+  onOpenImports: vi.fn(),
   onSave: vi.fn(),
   onOpenSettings: vi.fn(),
   onOpenHistory: vi.fn(),
@@ -105,6 +105,20 @@ describe('Sidebar', () => {
     expect(screen.getByText('Canvas')).toBeInTheDocument()
     expect(screen.getByText('Device Inventory')).toBeInTheDocument()
     expect(screen.getByText('Scan History')).toBeInTheDocument()
+  })
+
+  it('spins the Scan History icon while a scan runs, and not otherwise', async () => {
+    const icon = () => screen.getByText('Scan History').closest('button')!.querySelector('svg')!
+
+    vi.mocked(scanApi.runs).mockResolvedValue({ data: [{ status: 'done' }] } as never)
+    render(<Sidebar {...defaultProps} />)
+    await waitFor(() => expect(scanApi.runs).toHaveBeenCalled())
+    expect(icon().getAttribute('class')).not.toContain('animate-spin')
+
+    cleanup()
+    vi.mocked(scanApi.runs).mockResolvedValue({ data: [{ status: 'running' }] } as never)
+    render(<Sidebar {...defaultProps} />)
+    await waitFor(() => expect(icon().getAttribute('class')).toContain('animate-spin'))
   })
 
   // ── Stats ──────────────────────────────────────────────────────────────────
@@ -188,10 +202,10 @@ describe('Sidebar', () => {
     expect(defaultProps.onAddGroupRect).toHaveBeenCalledOnce()
   })
 
-  it('calls onZwaveImport when Z-Wave Import is clicked', () => {
+  it('calls onOpenImports when Import from… is clicked', () => {
     render(<Sidebar {...defaultProps} />)
-    fireEvent.click(screen.getByText('Z-Wave Import'))
-    expect(defaultProps.onZwaveImport).toHaveBeenCalledOnce()
+    fireEvent.click(screen.getByText('Import from…'))
+    expect(defaultProps.onOpenImports).toHaveBeenCalledOnce()
   })
 
   it('calls onSave when Save Canvas is clicked', () => {
@@ -312,6 +326,12 @@ describe('Sidebar', () => {
     expect(docs?.anchor).toBe('[data-tour="documentation"]')
     expect(document.querySelector(docs!.anchor!)).toBeInTheDocument()
 
+    // The imports step now points at the single picker entry, not at one of the
+    // per-source links it replaced.
+    const imports = STEPS.find((s) => s.id === 'imports')
+    expect(imports?.anchor).toBe('[data-tour="imports"]')
+    expect(document.querySelector(imports!.anchor!)).toBeInTheDocument()
+
     // Unmount before restoring, so the store reset never re-renders the sidebar.
     unmount()
     useDesignStore.setState({
@@ -361,9 +381,7 @@ describe('Sidebar (rack canvas)', () => {
     render(<Sidebar {...defaultProps} />)
     // Nothing here is scanned onto a rack — those actions belong to a diagram.
     expect(screen.queryByText('Scan Network')).not.toBeInTheDocument()
-    expect(screen.queryByText('Zigbee Import')).not.toBeInTheDocument()
-    expect(screen.queryByText('Z-Wave Import')).not.toBeInTheDocument()
-    expect(screen.queryByText('Proxmox Import')).not.toBeInTheDocument()
+    expect(screen.queryByText('Import from…')).not.toBeInTheDocument()
     // The Device Inventory stays: a rack mounts what the scans found.
     expect(screen.getByText('Device Inventory')).toBeInTheDocument()
   })

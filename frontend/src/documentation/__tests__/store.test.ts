@@ -272,6 +272,102 @@ describe('mutations', () => {
     expect(useDocsStore.getState().docs[0].tags).toEqual(['prod'])
   })
 
+  it('keeps an unsaved draft alive across a tag write, tags and all', async () => {
+    // The write moves `updated_at`. Left alone the stored draft would no longer
+    // match it, and the next open would drop it as stale — unsaved words gone
+    // because the user clicked a chip.
+    api.update.mockResolvedValue({
+      data: doc({ tags: ['prod'], updated_at: '2026-02-02T00:00:00Z' }),
+    } as never)
+    useDocsStore.setState({
+      docs: [summary()],
+      openDoc: doc({ body: '---\ntitle: NAS\n---\n\n# NAS\n', updated_at: '2026-01-01T00:00:00Z' }),
+    })
+    writeDraft('doc-1', {
+      body: '---\ntitle: NAS\n---\n\nwords the user never saved\n',
+      savedAt: 1,
+      base: '2026-01-01T00:00:00Z',
+    })
+
+    await useDocsStore.getState().setTags(['prod'])
+
+    const kept = readDraft('doc-1')
+    expect(kept?.base).toBe('2026-02-02T00:00:00Z')
+    expect(kept?.body).toContain('words the user never saved')
+    // Restoring that draft later must not revert the tag that was just set.
+    expect(kept?.body).toContain('tags: [prod]')
+  })
+
+  it('never pushes the unsaved draft to the server', async () => {
+    // Saving a body stays an explicit user action: a chip click writes the tags
+    // on the stored document, never on prose the user has not committed yet.
+    api.update.mockResolvedValue({ data: doc({ tags: ['prod'] }) } as never)
+    useDocsStore.setState({
+      docs: [summary()],
+      openDoc: doc({ body: '---\ntitle: NAS\n---\n\n# NAS\n', updated_at: '2026-01-01T00:00:00Z' }),
+    })
+    writeDraft('doc-1', {
+      body: 'words the user never saved',
+      savedAt: 1,
+      base: '2026-01-01T00:00:00Z',
+    })
+
+    await useDocsStore.getState().setTags(['prod'])
+
+    expect(api.update).toHaveBeenCalledWith('doc-1', {
+      body: '---\ntitle: NAS\ntags: [prod]\n---\n\n# NAS\n',
+    })
+  })
+
+  it('carries the tag change into a recovered draft still on screen', async () => {
+    api.update.mockResolvedValue({
+      data: doc({ tags: ['prod'], updated_at: '2026-02-02T00:00:00Z' }),
+    } as never)
+    useDocsStore.setState({
+      docs: [summary()],
+      openDoc: doc({ body: '---\ntitle: NAS\n---\n\n# NAS\n', updated_at: '2026-01-01T00:00:00Z' }),
+      pendingDraft: '---\ntitle: NAS\n---\n\nrecovered words\n',
+    })
+
+    await useDocsStore.getState().setTags(['prod'])
+
+    const pending = useDocsStore.getState().pendingDraft
+    expect(pending).toContain('recovered words')
+    expect(pending).toContain('tags: [prod]')
+  })
+
+  it('leaves the document now on screen alone when a tag write lands late', async () => {
+    // The user clicked a chip on doc-1, then opened doc-2 before the call came
+    // back. The answer belongs to doc-1: it may refresh doc-1's row and re-base
+    // doc-1's stored draft, but it must not paint doc-1 over doc-2.
+    let settle: (value: unknown) => void = () => {}
+    api.update.mockReturnValue(new Promise((resolve) => (settle = resolve)) as never)
+    useDocsStore.setState({
+      docs: [summary(), summary({ id: 'doc-2', title: 'Switch' })],
+      openDoc: doc({ body: '---\ntitle: NAS\n---\n\n# NAS\n', updated_at: '2026-01-01T00:00:00Z' }),
+    })
+    writeDraft('doc-1', {
+      body: '---\ntitle: NAS\n---\n\nwords the user never saved\n',
+      savedAt: 1,
+      base: '2026-01-01T00:00:00Z',
+    })
+
+    const inFlight = useDocsStore.getState().setTags(['prod'])
+    useDocsStore.setState({
+      openDoc: doc({ id: 'doc-2', title: 'Switch', body: 'the other document' }),
+      draft: 'the other draft',
+    })
+    settle({ data: doc({ tags: ['prod'], updated_at: '2026-02-02T00:00:00Z' }) })
+    await inFlight
+
+    expect(useDocsStore.getState().openDoc?.id).toBe('doc-2')
+    expect(useDocsStore.getState().draft).toBe('the other draft')
+    // doc-1's row still takes the new tags, and its draft is still carried
+    // forward — leaving it behind is the data loss this whole change is about.
+    expect(useDocsStore.getState().docs.find((d) => d.id === 'doc-1')?.tags).toEqual(['prod'])
+    expect(readDraft('doc-1')?.base).toBe('2026-02-02T00:00:00Z')
+  })
+
   it('reports a failed tag write rather than pretending it landed', async () => {
     api.update.mockRejectedValue({ response: { data: { detail: 'nope' } } })
     useDocsStore.setState({ openDoc: doc() })

@@ -390,10 +390,35 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
     const body = withTags(openDoc.body, tags)
     try {
       const { data } = await documentsApi.update(openDoc.id, { body })
-      set((state) => ({
-        openDoc: data,
-        docs: state.docs.map((d) => (d.id === data.id ? { ...d, ...data } : d)),
-      }))
+      // The write moves `updated_at`, which would leave an unsaved draft looking
+      // stale: `open` would drop it, and the user's words with it, for having
+      // clicked a chip. Carry the draft forward instead, with the same rewrite
+      // applied, so restoring it later keeps the tags rather than reverting them.
+      const draft = readDraft(openDoc.id)
+      if (draft) {
+        writeDraft(openDoc.id, {
+          body: withTags(draft.body, tags),
+          savedAt: draft.savedAt,
+          base: data.updated_at,
+        })
+      }
+      set((state) => {
+        // The list is keyed by id, so it takes the answer whichever document is
+        // on screen by now. What is on screen is another matter: the user may
+        // have moved on while this was in flight, and painting a stale document
+        // and its draft over the current one is how the other handlers here
+        // avoid ending up showing two documents at once.
+        const docs = state.docs.map((d) => (d.id === data.id ? { ...d, ...data } : d))
+        if (state.openDoc?.id !== data.id) return { docs }
+        const editing = state.draft === null ? null : withTags(state.draft, tags)
+        return {
+          docs,
+          openDoc: data,
+          draft: editing,
+          dirty: editing !== null && editing !== data.body,
+          pendingDraft: state.pendingDraft === null ? null : withTags(state.pendingDraft, tags),
+        }
+      })
       return true
     } catch (error) {
       set({ loadError: message(error, 'Could not save the tags') })

@@ -4,6 +4,7 @@ from mcp.server import Server
 from mcp.types import Tool, TextContent
 from .backend_client import backend
 from .devices import DEVICE_TOOL_NAMES, DEVICE_TOOLS, dispatch_device
+from .documents import DOC_TOOL_NAMES, DOC_TOOLS, dispatch_document
 from .racks import RACK_TOOL_NAMES, RACK_TOOLS, dispatch_rack
 
 
@@ -22,7 +23,7 @@ NODE_TYPES = [
 # Kept in sync manually with frontend/src/types/index.ts EdgeType.
 # Sync is enforced automatically by test_edge_types_in_sync_with_frontend (mcp/tests/test_edge_types_sync.py).
 EDGE_TYPES = [
-    "ethernet", "wifi", "iot", "vlan", "virtual", "cluster", "fibre", "electrical",
+    "ethernet", "wifi", "iot", "zigbee_mesh", "vlan", "virtual", "cluster", "fibre", "electrical",
 ]
 
 # Shared field schemas mirroring backend NodeBase / NodeUpdate (backend/app/schemas/nodes.py).
@@ -316,9 +317,10 @@ def _build_tools() -> list[Tool]:
     ]
 
 
-# The rack canvas and the inventory write routes live in their own modules —
-# both are big enough to bury the logical-canvas tools this file is about.
-TOOLS = _build_tools() + RACK_TOOLS + DEVICE_TOOLS
+# The rack canvas, the inventory write routes and the documentation space live
+# in their own modules — each is big enough to bury the logical-canvas tools
+# this file is about.
+TOOLS = _build_tools() + RACK_TOOLS + DEVICE_TOOLS + DOC_TOOLS
 
 
 def register_tools(server: Server):
@@ -410,6 +412,9 @@ async def _dispatch(name: str, args: dict) -> dict:
 
     if name in DEVICE_TOOL_NAMES:
         return await dispatch_device(name, args)
+
+    if name in DOC_TOOL_NAMES:
+        return await dispatch_document(name, args)
 
     if name == "create_node":
         return await backend.post("/api/v1/nodes", args)

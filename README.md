@@ -27,6 +27,7 @@
   <a href="#zigbee2mqtt-import">Zigbee / Z-Wave</a> ·
   <a href="#proxmox-ve-import">Proxmox</a> ·
   <a href="#live-view-read-only-public-canvas">Live View</a> ·
+  <a href="#rest-api">REST API</a> ·
   <a href="#mcp-server-ai-integration-optional">MCP Server</a>
 </p>
 
@@ -109,6 +110,40 @@ A device that changes after its document was written raises a **device data chan
 Full mode only — documents need the backend to store, index and search them.
 
 > **Full documentation:** [docs/documentation.md](./docs/documentation.md)
+
+---
+
+## Documentation View (read-only public documentation)
+
+Documentation View shares your documentation space — the tree, the pages and their
+version history — with anyone on your network, no login required. It is disabled by
+default, and uses its own key: enabling Live View does not enable this.
+
+### Activation
+
+Add `DOCS_VIEW_KEY` to your `.env`:
+
+`DOCS_VIEW_KEY=your-secret-key`
+
+Generate one with `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`, then
+restart the backend:
+
+`docker compose restart backend`
+
+### Usage
+
+Use this URL to read your documentation:
+
+`http://<your-homelab-ip>/docs?key=your-secret-key`
+
+The page shows the document tree, the filter box and any page you pick, plus its earlier
+versions. Nothing can be written: no editing, no restoring, no deleting. Your device
+inventory and your canvases are not reachable through it.
+
+> **Anyone holding that URL reads every document**, and every image a document embeds —
+> uploaded media is served without authentication. There is no per-document opt-in: the
+> key is all or nothing. Keep documentation you would not share out of Homelable, or
+> leave this off.
 
 ---
 
@@ -360,6 +395,40 @@ The backend port (`8000`) must be reachable from your gethomepage container.
 
 ---
 
+## REST API
+
+Everything the UI does goes through a documented JSON API under `/api/v1` —
+nodes, links, designs, racks, documents, the scanner. Script it to create nodes
+for new machines, attach properties, and wire links between them.
+
+Interactive documentation ships with the app, generated from the code so it
+never drifts:
+
+| URL | What |
+|---|---|
+| `http://<your-homelab-ip>:3000/docs` | Swagger UI — browse and call every endpoint |
+| `http://<your-homelab-ip>:3000/redoc` | ReDoc — the same schema, reference layout |
+| `http://<your-homelab-ip>:3000/openapi.json` | OpenAPI schema, for client generators |
+
+Authenticate with a bearer token from `POST /api/v1/auth/login`, then send it as
+`Authorization: Bearer <token>`:
+
+```bash
+TOKEN=$(curl -s http://<your-homelab-ip>:3000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"your-password"}' | jq -r .access_token)
+
+curl -s http://<your-homelab-ip>:3000/api/v1/nodes -H "Authorization: Bearer $TOKEN"
+```
+
+> **Full documentation:** [docs/api.md](./docs/api.md)
+
+> [!WARNING]
+> The docs endpoints are not behind authentication — anyone who can reach the
+> app can read the API shape (not your data). Keep Homelable on your LAN.
+
+---
+
 ## MCP Server (AI Integration) (optional)
 
 Homelable can exposes a [Model Context Protocol](https://modelcontextprotocol.io) server so any MCP-compatible AI client (Claude Code, Claude Desktop, Open WebUI…) can read your homelab topology and act on it.
@@ -447,6 +516,9 @@ Or add it manually to `~/.claude.json`:
 - *"Show me the full canvas topology."*
 - *"How much free U is left in the garage rack?"*
 - *"Mount the NAS in rack 1 and patch its first port to port 12 of the patch panel."*
+- *"Search the documentation for what we wrote about the backup schedule."*
+- *"Write a runbook page for restoring a Proxmox backup, then link it from the NAS document."*
+- *"Show me what changed in the firewall document, and restore the version before the last edit."*
 
 ### Security
 

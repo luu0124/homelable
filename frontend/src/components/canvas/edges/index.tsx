@@ -306,6 +306,9 @@ export function HomelableEdge({ id, source, target, sourceHandleId, targetHandle
 
   const activeTheme = useThemeStore((s) => s.activeTheme)
   const theme = THEMES[activeTheme]
+  // Read live: LQI visibility is a view preference on the edge type, not a
+  // value copied onto each edge, so toggling it redraws every link at once.
+  const customEdgeStyles = useThemeStore((s) => s.customStyle.edges)
   const sourceType = useStore((s) => s.nodeLookup.get(source)?.type)
   const targetType = useStore((s) => s.nodeLookup.get(target)?.type)
   const isBidirectional = sourceType === 'proxmox' && targetType === 'proxmox'
@@ -332,12 +335,17 @@ export function HomelableEdge({ id, source, target, sourceHandleId, targetHandle
     : { x: labelX, y: (sourceY + targetY) / 2 }
 
   const edgeType: EdgeType = data?.type ?? 'ethernet'
+  // `!= null` on purpose: LQI 0 is a real reading (a dead link), not "absent".
+  const showLqi = (customEdgeStyles[edgeType]?.showLqi ?? false) && data?.lqi != null
   const edgeColors = theme.colors.edgeColors
 
   const BASE_STYLES: Record<EdgeType, React.CSSProperties> = {
     ethernet: { stroke: edgeColors.ethernet, strokeWidth: 2 },
     wifi:     { stroke: edgeColors.wifi,     strokeWidth: 1.5, strokeDasharray: '6 3' },
     iot:      { stroke: edgeColors.iot,      strokeWidth: 1.5, strokeDasharray: '2 4' },
+    // Neighbour link, not a parent attachment: thinner, sparser and slightly
+    // faded so a full mesh import stays readable behind the tree.
+    zigbee_mesh: { stroke: edgeColors.zigbee_mesh, strokeWidth: 1, strokeDasharray: '1 5', opacity: 0.75 },
     vlan:     { strokeWidth: 2.5 },
     virtual:  { stroke: edgeColors.virtual,  strokeWidth: 1,   strokeDasharray: '4 4' },
     cluster:  { stroke: edgeColors.cluster,  strokeWidth: 2.5, strokeDasharray: '8 3' },
@@ -485,6 +493,21 @@ export function HomelableEdge({ id, source, target, sourceHandleId, targetHandle
       )}
 
       <EdgeLabelRenderer>
+        {showLqi && (
+          <div
+            className="absolute pointer-events-none font-mono text-[10px] px-1.5 py-0.5 rounded"
+            style={{
+              // Sits under the label when there is one, on the line otherwise.
+              transform: `translate(-50%, -50%) translate(${labelPosition.x}px, ${labelPosition.y + (data?.label ? 16 : 0)}px)`,
+              background: theme.colors.edgeLabelBackground,
+              color:      theme.colors.edgeLabelColor,
+              border:     `1px solid ${theme.colors.edgeLabelBorder}`,
+            }}
+          >
+            LQI {data!.lqi}
+          </div>
+        )}
+
         {data?.label && (
           <div
             className="absolute pointer-events-none font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-pre-line text-center"

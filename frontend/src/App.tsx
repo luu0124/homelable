@@ -28,6 +28,8 @@ import { SettingsModal } from '@/components/modals/SettingsModal'
 import { ZigbeeImportModal } from '@/components/zigbee/ZigbeeImportModal'
 import { ZwaveImportModal } from '@/components/zwave/ZwaveImportModal'
 import { ProxmoxImportModal } from '@/components/proxmox/ProxmoxImportModal'
+import { UnifiImportModal } from '@/components/unifi/UnifiImportModal'
+import { ImportSourceModal, type ImportSourceKey } from '@/components/modals/ImportSourceModal'
 import { GroupRectModal, type GroupRectFormData } from '@/components/modals/GroupRectModal'
 import { TextModal, type TextFormData } from '@/components/modals/TextModal'
 import { ThemeModal } from '@/components/modals/ThemeModal'
@@ -158,6 +160,8 @@ export default function App() {
   const [zigbeeImportOpen, setZigbeeImportOpen] = useState(false)
   const [zwaveImportOpen, setZwaveImportOpen] = useState(false)
   const [proxmoxImportOpen, setProxmoxImportOpen] = useState(false)
+  const [unifiImportOpen, setUnifiImportOpen] = useState(false)
+  const [importPickerOpen, setImportPickerOpen] = useState(false)
 
   // Declare handleSave before the Ctrl+S effect so it is in scope.
   // Returns true on success, false on failure — the design-switch effect relies
@@ -369,6 +373,16 @@ export default function App() {
     void loadDesignsAndCanvasRef.current()
   }, [])
 
+  /** The picker hands off to the source's own modal and gets out of the way —
+   *  it is a menu, not a step the user has to come back through. */
+  const openImportSource = useCallback((source: ImportSourceKey) => {
+    setImportPickerOpen(false)
+    if (source === 'zigbee') setZigbeeImportOpen(true)
+    else if (source === 'zwave') setZwaveImportOpen(true)
+    else if (source === 'proxmox') setProxmoxImportOpen(true)
+    else setUnifiImportOpen(true)
+  }, [])
+
   // Bridge the Getting Started tour steps to the App's modal controls. The overlay
   // calls closeAll() before each step, then the step's action to open the target.
   const walkthroughActions = useMemo<WalkthroughActionApi>(() => ({
@@ -381,6 +395,7 @@ export default function App() {
       setEditNodeId(null)
       setThemeModalOpen(false)
       setZigbeeImportOpen(false)
+      setImportPickerOpen(false)
       // The Documentation steps replace the whole main pane; every other step
       // anchors on the toolbar or the canvas, so put the view back first.
       setAppView('canvas')
@@ -418,7 +433,7 @@ export default function App() {
       }))
     },
     openStyle: () => setThemeModalOpen(true),
-    openZigbeeImport: () => setZigbeeImportOpen(true),
+    openImportPicker: () => setImportPickerOpen(true),
     openDocumentation: () => setAppView('documentation'),
   }), [openInventoryModal, setAppView])
 
@@ -879,12 +894,16 @@ export default function App() {
     })
     // Add IoT edges between Zigbee devices: parent bottom -> child top
     zigbeeEdges.forEach((ze) => {
+      // A neighbour link is not a parent attachment: own type, own colour, and
+      // drawn sideways so it reads apart from the tree.
+      const isMesh = ze.kind === 'mesh'
       onConnect({
         source: ze.source,
-        sourceHandle: 'bottom',
+        sourceHandle: isMesh ? 'right' : 'bottom',
         target: ze.target,
-        targetHandle: 'top-t',
-        type: 'iot',
+        targetHandle: isMesh ? 'left' : 'top-t',
+        type: isMesh ? 'zigbee_mesh' : 'iot',
+        lqi: ze.lqi ?? undefined,
       } as unknown as import('@xyflow/react').Connection)
     })
     // Auto-select only the freshly imported nodes so the user can drag the
@@ -1135,9 +1154,7 @@ export default function App() {
             onAddGroupRect={() => setAddGroupRectOpen(true)}
             onAddText={() => setAddTextOpen(true)}
             onScan={() => setScanConfigOpen(true)}
-            onZigbeeImport={() => setZigbeeImportOpen(true)}
-            onZwaveImport={() => setZwaveImportOpen(true)}
-            onProxmoxImport={() => setProxmoxImportOpen(true)}
+            onOpenImports={() => setImportPickerOpen(true)}
             onSave={handleSave}
             onOpenSettings={() => setSettingsOpen(true)}
             onOpenHistory={() => setScanHistoryOpen(true)}
@@ -1289,6 +1306,14 @@ export default function App() {
         )}
 
         {!STANDALONE && (
+          <ImportSourceModal
+            open={importPickerOpen}
+            onClose={() => setImportPickerOpen(false)}
+            onPick={openImportSource}
+          />
+        )}
+
+        {!STANDALONE && (
           <ZigbeeImportModal
             open={zigbeeImportOpen}
             onClose={() => setZigbeeImportOpen(false)}
@@ -1318,6 +1343,16 @@ export default function App() {
             onInventoryImported={() => {
               toast.success('Proxmox import started — check Scan History for results')
             }}
+          />
+        )}
+
+        {!STANDALONE && (
+          <UnifiImportModal
+            open={unifiImportOpen}
+            onClose={() => setUnifiImportOpen(false)}
+            // The UniFi import is synchronous and already reports its counts,
+            // so land the user on what it just created.
+            onInventoryImported={() => openInventoryModal()}
           />
         )}
 
