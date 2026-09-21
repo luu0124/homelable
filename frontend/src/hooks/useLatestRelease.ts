@@ -7,16 +7,6 @@ interface ReleaseInfo {
 
 let cache: ReleaseInfo | null | 'error' | 'pending' = null
 
-/**
- * Drop a SemVer pre-release/build suffix so a locally tagged build compares
- * equal to the upstream release it is based on: this fork ships `3.4.1-luu`
- * off upstream's `3.4.1` and must not report itself as perpetually outdated.
- * A genuinely newer upstream release still differs in its base version.
- */
-function baseVersion(version: string): string {
-  return version.split(/[-+]/)[0]
-}
-
 export function useLatestRelease(currentVersion: string) {
   const [latest, setLatest] = useState<ReleaseInfo | null>(
     cache && cache !== 'error' && cache !== 'pending' ? cache : null,
@@ -47,7 +37,6 @@ export function useLatestRelease(currentVersion: string) {
       })
   }, [])
 
-  const hasUpdate =
-    latest !== null && baseVersion(latest.version) !== baseVersion(currentVersion)
+  const hasUpdate = latest !== null && latest.version !== currentVersion
   return { latest, hasUpdate }
 }

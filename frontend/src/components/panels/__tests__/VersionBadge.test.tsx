@@ -68,14 +68,16 @@ describe('VersionBadge', () => {
     vi.mocked(useLatestRelease).mockReturnValue({ latest: null, hasUpdate: false })
   })
 
-  it('displays the current app version', () => {
+  it('displays the current app version, fork tag included', () => {
     renderSidebar()
-    expect(screen.getByText(`v${__APP_VERSION__}`)).toBeInTheDocument()
+    expect(screen.getByText(`v${__APP_DISPLAY_VERSION__}`)).toBeInTheDocument()
   })
 
   it('links current version to its GitHub release page', () => {
     renderSidebar()
-    const link = screen.getByText(`v${__APP_VERSION__}`).closest('a')
+    const link = screen.getByText(`v${__APP_DISPLAY_VERSION__}`).closest('a')
+    // The href carries the plain upstream version even when the label is tagged:
+    // no release is ever published under a local fork tag.
     expect(link).toHaveAttribute(
       'href',
       `https://github.com/Pouzor/homelable/releases/tag/v${__APP_VERSION__}`,

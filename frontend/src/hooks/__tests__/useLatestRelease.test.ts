@@ -33,22 +33,6 @@ describe('useLatestRelease', () => {
     expect(result.current.hasUpdate).toBe(false)
   })
 
-  it('returns no update when current version only adds a fork suffix', async () => {
-    mockFetch({ tag_name: 'v1.8.3', html_url: 'https://github.com/Pouzor/homelable/releases/tag/v1.8.3' })
-    const useLatestRelease = await freshHook()
-    const { result } = renderHook(() => useLatestRelease('1.8.3-luu'))
-    await waitFor(() => expect(result.current.latest).not.toBeNull())
-    expect(result.current.hasUpdate).toBe(false)
-  })
-
-  it('still reports a newer upstream release to a suffixed build', async () => {
-    mockFetch({ tag_name: 'v1.9.0', html_url: 'https://github.com/Pouzor/homelable/releases/tag/v1.9.0' })
-    const useLatestRelease = await freshHook()
-    const { result } = renderHook(() => useLatestRelease('1.8.3-luu'))
-    await waitFor(() => expect(result.current.hasUpdate).toBe(true))
-    expect(result.current.latest?.version).toBe('1.9.0')
-  })
-
   it('returns update when latest version is newer', async () => {
     mockFetch({ tag_name: 'v1.9.0', html_url: 'https://github.com/Pouzor/homelable/releases/tag/v1.9.0' })
     const useLatestRelease = await freshHook()

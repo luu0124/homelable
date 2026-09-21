@@ -405,7 +405,7 @@ function VersionBadge() {
           rel="noopener noreferrer"
           className="font-mono text-[11px] text-muted-foreground hover:text-foreground transition-colors"
         >
-          v{current}
+          v{__APP_DISPLAY_VERSION__}
         </a>
         <span className="text-[11px] text-muted-foreground">-</span>
         <a

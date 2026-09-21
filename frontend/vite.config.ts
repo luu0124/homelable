@@ -6,6 +6,12 @@ import tailwindcss from '@tailwindcss/vite'
 
 const appVersion = fs.readFileSync(path.resolve(__dirname, '../VERSION'), 'utf-8').trim()
 
+// VERSION stays the upstream release this build is based on, so the update check and
+// the release link keep matching a tag that exists in Pouzor/homelable. FORK_TAG is
+// cosmetic only: it marks the sidebar badge as a local build. Empty string = upstream.
+const FORK_TAG = 'luu'
+const displayVersion = FORK_TAG ? `${appVersion}-${FORK_TAG}` : appVersion
+
 // Serve Homelable under a subpath (`VITE_BASE_PATH=/homelab/`) instead of the root of
 // an origin. Defaults to '/', where the built output is byte-for-byte what it was
 // before this knob existed. Mirrors `normalizeBasePath` in src/utils/basePath.ts —
@@ -18,6 +24,7 @@ export default defineConfig({
   base,
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
+    __APP_DISPLAY_VERSION__: JSON.stringify(displayVersion),
   },
   plugins: [react(), tailwindcss()],
   resolve: {
