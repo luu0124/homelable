@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.db.database import AsyncSessionLocal, get_db
 from app.db.models import (
     Design,
+    Document,
     Edge,
     InventoryDevice,
     InventoryDeviceLink,
@@ -310,7 +311,17 @@ async def rescan_device(
     if device.status == "hidden":
         raise HTTPException(status_code=409, detail="Device is hidden")
 
-    target = f"{device.ip}/32"
+    device_ips = []
+    for candidate in _ip_tokens(device.ip):
+        try:
+            device_ips.append(str(ipaddress.ip_address(candidate)))
+        except ValueError:
+            continue
+    if not device_ips:
+        raise HTTPException(status_code=409, detail="Device has no valid IP address to scan")
+    # A row may retain multiple observed addresses. The deep-rescan operation
+    # targets the first valid address, matching the scanner's single-host API.
+    target = f"{device_ips[0]}/32"
     running = (await db.execute(
         select(ScanRun).where(ScanRun.status == "running", ScanRun.kind == "device")
     )).scalars().all()
@@ -541,10 +552,16 @@ async def clear_pending(
     _: str = Depends(get_current_user),
 ) -> dict[str, int]:
     from sqlalchemy import delete as sa_delete
-    pending_ids = (
-        await db.execute(select(InventoryDevice.id).where(InventoryDevice.status == "pending"))
-    ).scalars().all()
-    await unlink_documents(db, device_ids=list(pending_ids))
+    from sqlalchemy import update as sa_update
+
+    # Unlink by subquery, not by a list of ids read beforehand: a device approved
+    # between that read and the delete would lose its documents without being
+    # deleted. The UPDATE takes SQLite's write lock, so the set it unlinks is the
+    # set the DELETE removes. (#444)
+    pending = select(InventoryDevice.id).where(InventoryDevice.status == "pending")
+    await db.execute(
+        sa_update(Document).where(Document.device_id.in_(pending)).values(device_id=None)
+    )
     result = await db.execute(sa_delete(InventoryDevice).where(InventoryDevice.status == "pending"))
     await db.commit()
     return {"deleted": result.rowcount}

@@ -4,7 +4,9 @@ Fetches hosts/VMs/LXC from the Proxmox REST API and upserts them into the
 pending inventory (same review→approve flow as scans and mesh imports).
 
 Credentials: the API token comes from the request body when provided, else
-falls back to the server-configured env token (``settings.proxmox_token_*``).
+falls back to the server-configured env token (``settings.proxmox_token_*``) —
+only for the configured host and port, and never with TLS verification off
+when the server keeps it on.
 The token is never persisted by the app and never returned by any endpoint.
 """
 
@@ -59,18 +61,42 @@ _PVE_IEEE_PREFIX = "pve-"
 
 
 def _resolve_credentials(payload: ProxmoxConnectionRequest) -> tuple[str, str]:
-    """Pick the API token: request body first, else server env config.
+    """Resolve credentials without sending server secrets to custom hosts.
 
-    Raises HTTP 400 when neither carries a token.
+    Environment credentials are only valid for the configured Proxmox endpoint.
+    A custom endpoint must provide both token fields explicitly.
     """
-    token_id = payload.token_id or settings.proxmox_token_id
-    token_secret = payload.token_secret or settings.proxmox_token_secret
-    if not token_id or not token_secret:
+    has_request_token = bool(payload.token_id or payload.token_secret)
+    if has_request_token:
+        if not payload.token_id or not payload.token_secret:
+            raise HTTPException(status_code=400, detail="Provide both Proxmox token fields")
+        return payload.token_id, payload.token_secret
+
+    configured_host = settings.proxmox_host.strip().rstrip(".").lower()
+    request_host = payload.host.strip().rstrip(".").lower()
+    if (
+        not configured_host
+        or request_host != configured_host
+        or payload.port != settings.proxmox_port
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Custom Proxmox hosts require an explicit API token",
+        )
+    # Verifying more strictly than configured is fine (the modal's checkbox
+    # defaults to on, over a self-signed env setup); turning off verification
+    # the server keeps on would hand the env token to an unverified peer.
+    if settings.proxmox_verify_tls and not payload.verify_tls:
+        raise HTTPException(
+            status_code=400,
+            detail="The server-configured Proxmox token requires TLS verification",
+        )
+    if not settings.proxmox_token_id or not settings.proxmox_token_secret:
         raise HTTPException(
             status_code=400,
             detail="No Proxmox API token provided and none configured on the server.",
         )
-    return token_id, token_secret
+    return settings.proxmox_token_id, settings.proxmox_token_secret
 
 
 @router.post("/test-connection", response_model=ProxmoxTestConnectionResponse)

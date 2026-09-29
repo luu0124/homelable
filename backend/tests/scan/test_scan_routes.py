@@ -565,3 +565,104 @@ async def test_get_run_returns_status(client: AsyncClient, headers, pending_devi
 async def test_get_run_unknown_id_404(client: AsyncClient, headers):
     res = await client.get(f"/api/v1/scan/runs/{uuid.uuid4()}", headers=headers)
     assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_clear_pending_deletes_pending_and_unlinks_their_documents(client: AsyncClient, headers, db_session):
+    from sqlalchemy import select
+
+    from app.db.models import Document
+
+    pending = InventoryDevice(id=str(uuid.uuid4()), ip="10.0.0.1", status="pending")
+    approved = InventoryDevice(id=str(uuid.uuid4()), ip="10.0.0.2", status="approved")
+    db_session.add_all([pending, approved])
+    await db_session.flush()
+    pending_doc = Document(title="p", slug="p", device_id=pending.id, body="# p")
+    approved_doc = Document(title="a", slug="a", device_id=approved.id, body="# a")
+    db_session.add_all([pending_doc, approved_doc])
+    await db_session.commit()
+
+    res = await client.delete("/api/v1/scan/pending", headers=headers)
+    assert res.status_code == 200
+    assert res.json() == {"deleted": 1}
+
+    approved_id, pending_doc_id, approved_doc_id = approved.id, pending_doc.id, approved_doc.id
+    db_session.expire_all()
+    ids = (await db_session.execute(select(InventoryDevice.id))).scalars().all()
+    assert ids == [approved_id]
+    assert (await db_session.get(Document, pending_doc_id)).device_id is None
+    assert (await db_session.get(Document, approved_doc_id)).device_id == approved_id
+
+
+@pytest.mark.asyncio
+async def test_clear_pending_keeps_documents_of_a_device_approved_mid_clear(client: AsyncClient, headers, db_session):
+    """#444 — an approval landing between the moment the pending set is read and
+    the moment its documents are unlinked must not orphan the approved device's
+    documents. The approval is injected right before the documents UPDATE."""
+    from sqlalchemy import event, select
+
+    from app.db.models import Document
+
+    device = InventoryDevice(id=str(uuid.uuid4()), ip="10.0.0.3", status="pending")
+    db_session.add(device)
+    await db_session.flush()
+    doc = Document(title="d", slug="d", device_id=device.id, body="# d")
+    db_session.add(doc)
+    await db_session.commit()
+    device_id, doc_id = device.id, doc.id
+
+    fired = False
+
+    def approve_before_unlink(conn, cursor, statement, parameters, context, executemany):
+        nonlocal fired
+        if not fired and statement.lstrip().upper().startswith("UPDATE DOCUMENTS"):
+            fired = True
+            cursor.execute(
+                "UPDATE device_inventory SET status = 'approved' WHERE id = ?", (device_id,)
+            )
+
+    sync_engine = db_session.bind.sync_engine
+    event.listen(sync_engine, "before_cursor_execute", approve_before_unlink)
+    try:
+        res = await client.delete("/api/v1/scan/pending", headers=headers)
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", approve_before_unlink)
+
+    assert fired
+    assert res.json() == {"deleted": 0}
+    db_session.expire_all()
+    status = (
+        await db_session.execute(select(InventoryDevice.status).where(InventoryDevice.id == device_id))
+    ).scalar_one()
+    assert status == "approved"
+    assert (await db_session.get(Document, doc_id)).device_id == device_id
+
+
+@pytest.mark.asyncio
+async def test_rescan_device_targets_first_valid_ip(client: AsyncClient, headers, db_session):
+    """A multi-address row scans one validated host, never the raw field."""
+    device = InventoryDevice(
+        id=str(uuid.uuid4()), ip="not-an-ip, 192.168.1.50, 192.168.1.51", status="pending"
+    )
+    db_session.add(device)
+    await db_session.commit()
+    with patch("app.api.routes.scan._background_device_scan", new_callable=AsyncMock):
+        res = await client.post(f"/api/v1/scan/pending/{device.id}/rescan", headers=headers)
+    assert res.status_code == 200, res.text
+    assert res.json()["ranges"] == ["192.168.1.50/32"]
+
+
+@pytest.mark.asyncio
+async def test_rescan_device_rejects_ip_field_with_no_valid_address(
+    client: AsyncClient, headers, db_session
+):
+    """Regression: the raw ip field went to nmap as the target, so a value shaped
+    like an nmap option reached the command line."""
+    device = InventoryDevice(id=str(uuid.uuid4()), ip="-iL /etc/passwd", status="pending")
+    db_session.add(device)
+    await db_session.commit()
+    with patch("app.api.routes.scan._background_device_scan", new_callable=AsyncMock) as bg:
+        res = await client.post(f"/api/v1/scan/pending/{device.id}/rescan", headers=headers)
+    assert res.status_code == 409
+    assert res.json()["detail"] == "Device has no valid IP address to scan"
+    bg.assert_not_called()
