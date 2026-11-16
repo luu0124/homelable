@@ -171,6 +171,11 @@ describe('faceplate catalog', () => {
     expect(suggestFaceplate('patch_panel')).toBe('patch-24')
   })
 
+  it('mounts an AI / LLM server on a 2U GPU-sized plate', () => {
+    expect(suggestFaceplate('ai_server')).toBe('server-2u-bays')
+    expect(UNRACKABLE_TYPES.has('ai_server')).toBe(false)
+  })
+
   it('falls back to the first plate on an unknown id', () => {
     expect(getFaceplate('does-not-exist')).toBe(FACEPLATES[0])
   })
@@ -209,3 +214,14 @@ describe('bank', () => {
     expect(ports.map((p) => p.label)).toEqual(['sfp3', 'sfp4'])
   })
 })
+
+describe('hasPortBay', () => {
+  it('is true for plates whose sockets sit in a bay, false otherwise', async () => {
+    const { hasPortBay } = await import('../faceplates')
+    expect(hasPortBay('patch-24')).toBe(true)
+    expect(hasPortBay('switch-24')).toBe(true)
+    expect(hasPortBay('server-1u')).toBe(false)
+    expect(hasPortBay('blank-1u')).toBe(false)
+  })
+})
+

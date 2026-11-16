@@ -103,7 +103,7 @@ export const liveviewApi = {
 }
 
 /**
- * The read-only documentation space at `/docs?key=…`.
+ * The read-only documentation space at `/documentation?key=…`.
  *
  * On `publicApi`, like live view: no JWT rides along, and a 401 must not bounce
  * a reader towards a login they do not have. Reads only — the public router
@@ -276,12 +276,55 @@ export const settingsApi = {
   save: (data: AppSettings) => api.post<AppSettingsResponse>('/settings', data),
 }
 
+/** The outcome of the last git sync, kept server-side across restarts. */
+export interface GitSyncLast {
+  status: 'pushed' | 'unchanged' | 'failed'
+  at: string
+  commit: string | null
+  files_changed: number
+  error: string | null
+}
+
+/** What GIT_SYNC_* configures. Read-only: the connection is env-only, and the
+ *  token never leaves the server. */
+export interface GitSyncStatus {
+  configured: boolean
+  repo_url: string | null
+  branch: string | null
+  path: string | null
+  auth: 'token' | 'ssh' | 'none' | null
+  running: boolean
+  last: GitSyncLast | null
+}
+
+export interface GitSyncResult {
+  status: 'pushed' | 'unchanged'
+  commit: string | null
+  files_changed: number
+  documents: number
+  diagrams: number
+  synced_at: string
+}
+
+export const gitSyncApi = {
+  status: () => api.get<GitSyncStatus>('/git-sync'),
+  sync: () => api.post<GitSyncResult>('/git-sync'),
+}
+
 export interface ProxmoxConnection {
   host: string
   port: number
   token_id?: string
   token_secret?: string
   verify_tls?: boolean
+}
+
+/** One env-configured Proxmox endpoint, for display. Never carries a token. */
+export interface ProxmoxEndpointInfo {
+  name: string
+  host: string
+  port: number
+  verify_tls: boolean
 }
 
 export interface ProxmoxConfigData {
@@ -291,6 +334,8 @@ export interface ProxmoxConfigData {
   sync_enabled: boolean
   sync_interval: number
   token_configured: boolean
+  /** Every endpoint auto-sync covers: PROXMOX_HOST, then PROXMOX_ENDPOINTS. */
+  endpoints?: ProxmoxEndpointInfo[]
 }
 
 export const proxmoxApi = {
@@ -322,6 +367,7 @@ export const proxmoxApi = {
   saveConfig: (data: { sync_enabled: boolean; sync_interval: number }) =>
     api.post<ProxmoxConfigData>('/proxmox/config', data),
 
+  /** One scan run per configured server, in sync order. */
   syncNow: () =>
     api.post<{
       id: string
@@ -332,7 +378,47 @@ export const proxmoxApi = {
       started_at: string
       finished_at: string | null
       error: string | null
-    }>('/proxmox/sync-now'),
+    }[]>('/proxmox/sync-now'),
+}
+
+export interface UnraidConnection {
+  host: string
+  /** Omitted = 443 for HTTPS, 80 for HTTP. */
+  port?: number
+  api_key?: string
+  use_https?: boolean
+  verify_tls?: boolean
+  /** Import (and list) stopped containers and VMs too. */
+  include_offline?: boolean
+}
+
+export interface UnraidConfigData {
+  host: string
+  port: number
+  use_https: boolean
+  verify_tls: boolean
+  sync_enabled: boolean
+  sync_interval: number
+  include_offline: boolean
+  api_key_configured: boolean
+}
+
+export const unraidApi = {
+  testConnection: (data: UnraidConnection) =>
+    api.post<{ connected: boolean; message: string }>('/unraid/test-connection', data),
+
+  importNetwork: (data: UnraidConnection) =>
+    api.post<import('@/components/unraid/types').UnraidImportResponse>('/unraid/import', data),
+
+  importToPending: (data: UnraidConnection) =>
+    api.post<ScanRunResult>('/unraid/import-pending', data),
+
+  getConfig: () => api.get<UnraidConfigData>('/unraid/config'),
+  // Only the auto-sync activation is persisted; connection config is env-only.
+  saveConfig: (data: { sync_enabled: boolean; sync_interval: number; include_offline: boolean }) =>
+    api.post<UnraidConfigData>('/unraid/config', data),
+
+  syncNow: () => api.post<ScanRunResult>('/unraid/sync-now'),
 }
 
 export const designsApi = {
@@ -344,6 +430,8 @@ export const designsApi = {
   update: (id: string, data: { name?: string; icon?: string }) =>
     api.put<import('@/types').Design>(`/designs/${id}`, data),
   delete: (id: string) => api.delete(`/designs/${id}`),
+  /** Set the canvas list order; `ids` must name every design once. */
+  reorder: (ids: string[]) => api.put('/designs/order', { ids }),
 }
 
 export const documentsApi = {
@@ -369,6 +457,7 @@ export const documentsApi = {
       parent_id?: string | null
       sort_order?: number
       starred?: boolean
+      is_homepage?: boolean
       reviewed?: boolean
       resync_facts?: boolean
     },

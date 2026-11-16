@@ -13,9 +13,12 @@ place of the value. A blank section is the document telling the user what has no
 been written yet; omitting it would hide the gap.
 """
 
-from collections.abc import Callable
+import ipaddress
+from collections.abc import Callable, Iterable
 from datetime import date, datetime
 from typing import Any
+
+from app.core.config import settings
 
 # Sections whose data is structural rather than descriptive: they are dropped
 # entirely rather than printed empty, because an unracked device has no rack
@@ -32,6 +35,7 @@ TEMPLATE_INCIDENT = "incident"
 TEMPLATE_PROCEDURE = "procedure"
 TEMPLATE_DECISION = "decision"
 TEMPLATE_ZONE = "zone"
+TEMPLATE_HOMEPAGE = "homepage"
 
 # Frontmatter carries a version from the first release: documents round-trip to
 # disk through export/import, so the on-disk shape is a compatibility surface.
@@ -307,15 +311,31 @@ def block_network(device: Any, *, connections: list[str] | None = None, **_: Any
     )
 
 
-def _guess_subnet(ip: str | None) -> str | None:
-    """The /24 an IPv4 address sits in. Multi-IP fields keep the first token."""
+def _guess_subnet(ip: str | None, ranges: Iterable[str] | None = None) -> str | None:
+    """The subnet an IPv4 address sits in. Multi-IP fields keep the first token.
+
+    A configured scan range wins over the guess, so a /23 LAN reads as one
+    subnet rather than two /24s (#581); the most specific range wins when they
+    overlap. Outside every range, the address falls back to its own /24.
+    """
     if not ip:
         return None
-    first = ip.split(",")[0].strip()
-    octets = first.split(".")
-    if len(octets) != 4 or not all(o.isdigit() for o in octets):
+    first = ip.split(",")[0].strip().split("/")[0]
+    try:
+        addr = ipaddress.IPv4Address(first)
+    except ValueError:
         return None
-    return f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
+    best: ipaddress.IPv4Network | None = None
+    for cidr in settings.scanner_ranges if ranges is None else ranges:
+        try:
+            net = ipaddress.ip_network(str(cidr).strip(), strict=False)
+        except ValueError:
+            continue
+        if isinstance(net, ipaddress.IPv4Network) and addr in net and (best is None or net.prefixlen > best.prefixlen):
+            best = net
+    if best is None:
+        best = ipaddress.IPv4Network(f"{addr}/24", strict=False)
+    return str(best)
 
 
 BLOCKS: dict[str, Callable[..., str]] = {
@@ -537,7 +557,7 @@ _LIBRARY_TEMPLATES: dict[str, tuple[str, list[str]]] = {
     TEMPLATE_ZONE: ("zone", ["Purpose", "Members", "Addressing", "Access", "Notes"]),
 }
 
-TEMPLATE_IDS = frozenset({TEMPLATE_DEVICE, *_LIBRARY_TEMPLATES})
+TEMPLATE_IDS = frozenset({TEMPLATE_DEVICE, TEMPLATE_HOMEPAGE, *_LIBRARY_TEMPLATES})
 
 
 def render_library_document(template_id: str, title: str, *, today: date | None = None) -> str:
@@ -556,4 +576,94 @@ def render_library_document(template_id: str, title: str, *, today: date | None 
     parts = [front, "", f"# {title}", ""]
     for heading in headings:
         parts += [f"## {heading}", "", _PROMPT, ""]
+    return "\n".join(parts)
+
+
+# ── homepage ────────────────────────────────────────────────────────────────
+
+# The gear a homelab hangs off, in the order it is listed: the way in first.
+_KEY_DEVICE_TYPES = ("isp", "router", "firewall", "switch", "ap", "nas", "proxmox", "server")
+_KEY_DEVICE_LIMIT = 8
+_LIBRARY_INDEX_LIMIT = 15
+
+_DESIGN_KINDS = {"network": "network", "electrical": "electrical", "rack": "rack"}
+
+_NEXT_STEPS = (
+    "Document the router or gateway",
+    "Write a first runbook for something that breaks",
+    "Add `review_every:` to the pages that go stale",
+    "Share the read-only link with whoever helps when you are away",
+)
+
+
+def render_homepage_document(
+    title: str,
+    *,
+    designs: list[Any],
+    docs: list[Any],
+    devices: list[Any],
+    today: date | None = None,
+) -> str:
+    """The homepage, filled in once from what the database holds right now.
+
+    A table of contents rather than a dashboard: every line is a link, and none
+    of it refreshes — the body is the user's from the first save, like any page.
+    Links name ids, not titles, so a rename never breaks them.
+    """
+    today = today or date.today()
+    front = render_frontmatter(
+        {
+            "homelable": FRONTMATTER_VERSION,
+            "title": title,
+            "template": TEMPLATE_HOMEPAGE,
+            "tags": [],
+            "created": today.isoformat(),
+        }
+    )
+    parts = [front, "", f"# {title}", "", "_Where everything in this homelab is written down._", ""]
+
+    parts += ["## Canvases", ""]
+    if designs:
+        for design in designs:
+            kind = _DESIGN_KINDS.get(getattr(design, "design_type", None) or "network", "network")
+            parts.append(f"- [{design.name}](?design={design.id}) — {kind}")
+    else:
+        parts.append("_No canvas yet._")
+    parts.append("")
+
+    tree = [d for d in docs if d.kind in ("page", "folder")]
+    starred = sorted((d for d in docs if d.starred), key=lambda d: d.title.lower())
+    top = sorted(
+        (d for d in tree if not d.parent_id and not d.starred),
+        key=lambda d: (d.kind != "folder", d.sort_order or 0, d.title.lower()),
+    )
+    parts += ["## Library", ""]
+    if not starred and not top:
+        parts.append("_Nothing filed yet — runbooks and overviews land here._")
+    for doc in [*starred, *top][:_LIBRARY_INDEX_LIMIT]:
+        mark = "★ " if doc.starred else ""
+        folder = " (folder)" if doc.kind == "folder" else ""
+        parts.append(f"- {mark}[[doc:{doc.id}|{doc.title}]]{folder}")
+    parts.append("")
+
+    documented = {d.device_id for d in docs if d.device_id}
+    key_devices = sorted(
+        (d for d in devices if device_type(d) in _KEY_DEVICE_TYPES),
+        key=lambda d: (_KEY_DEVICE_TYPES.index(device_type(d) or ""), device_name(d).lower()),
+    )[:_KEY_DEVICE_LIMIT]
+    parts += ["## Key devices", ""]
+    if not key_devices:
+        parts.append("_No router, switch, NAS or hypervisor in the inventory yet._")
+    for device in key_devices:
+        name = device_name(device)
+        # A device link only resolves to a document that exists; without one it
+        # would offer to create a blank page under the device's name instead.
+        label = f"[[device:{device.id}|{name}]]" if device.id in documented else name
+        ip = f" — `{device.ip}`" if getattr(device, "ip", None) else ""
+        parts.append(f"- {label} · {device_type(device)}{ip}")
+    parts.append("")
+
+    parts += ["## Next steps", ""]
+    parts += [f"- [ ] {step}" for step in _NEXT_STEPS]
+    parts.append("")
     return "\n".join(parts)

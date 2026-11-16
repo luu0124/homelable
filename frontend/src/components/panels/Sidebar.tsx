@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react'
-import { Plus, Save, ScanLine, ChevronLeft, ChevronRight, LayoutDashboard, Clock, Square, Settings, LogOut, Download, Type, PlusCircle, Pencil, Trash2, Rows3, BookOpen, Loader2 } from 'lucide-react'
+import { Plus, Save, ScanLine, ChevronLeft, ChevronRight, LayoutDashboard, Clock, Square, Settings, LogOut, Download, Type, PlusCircle, Pencil, Trash2, ChevronUp, ChevronDown, Rows3, BookOpen, Loader2 } from 'lucide-react'
 import { Logo } from '@/components/ui/Logo'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useCanvasStore } from '@/stores/canvasStore'
@@ -10,6 +10,7 @@ import * as standaloneStorage from '@/utils/standaloneStorage'
 import { resolveDesignIcon, DEFAULT_DESIGN_ICON } from '@/utils/designIcons'
 import { DesignModal, type DesignFormData } from '@/components/modals/DesignModal'
 import { useUiStore } from '@/stores/uiStore'
+import { useDocsStore } from '@/documentation/store'
 import { AccessoryTray } from '@/rack/components/AccessoryTray'
 import { useRackStore } from '@/rack/store'
 import { freeUnits } from '@/rack/layout'
@@ -35,7 +36,7 @@ interface SidebarProps {
 export function Sidebar({ onAddNode, onAddGroupRect, onAddText, onScan, onOpenImports, onSave, onOpenSettings, onOpenHistory, onOpenInventory }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(false)
   const logout = useAuthStore((s) => s.logout)
-  const { designs, activeDesignId, activeDesignType, setActiveDesign, addDesign, updateDesign, removeDesign } = useDesignStore()
+  const { designs, activeDesignId, activeDesignType, setActiveDesign, addDesign, updateDesign, removeDesign, reorderDesigns } = useDesignStore()
   const view = useUiStore((s) => s.view)
   const setView = useUiStore((s) => s.setView)
   const isRack = activeDesignType === 'rack'
@@ -119,6 +120,26 @@ export function Sidebar({ onAddNode, onAddGroupRect, onAddText, onScan, onOpenIm
     }
   }, [designs.length, removeDesign])
 
+  // Swap a canvas with its neighbour. Applied at once, rolled back if the save fails.
+  const handleDesignMove = useCallback(async (index: number, offset: -1 | 1) => {
+    const target = index + offset
+    if (target < 0 || target >= designs.length) return
+    const previous = designs.map((d) => d.id)
+    const ids = [...previous]
+    ;[ids[index], ids[target]] = [ids[target], ids[index]]
+    reorderDesigns(ids)
+    try {
+      if (STANDALONE) {
+        standaloneStorage.reorderDesigns(ids)
+      } else {
+        await designsApi.reorder(ids)
+      }
+    } catch {
+      reorderDesigns(previous)
+      toast.error('Failed to reorder canvases')
+    }
+  }, [designs, reorderDesigns])
+
   const handleUploadImage = useCallback(async (file: File): Promise<string> => {
     try {
       const { url } = await mediaApi.upload(file)
@@ -185,13 +206,13 @@ export function Sidebar({ onAddNode, onAddGroupRect, onAddText, onScan, onOpenIm
               {/* Overlay to close */}
               <div className="fixed inset-0 z-40" onClick={() => setDesignSwitcherOpen(false)} />
               <div className="absolute left-2 right-2 top-full mt-1 z-50 bg-[#21262d] border border-border rounded-md shadow-xl overflow-hidden">
-                {designs.map((d) => {
+                {designs.map((d, index) => {
                   const Icon = resolveDesignIcon(d.icon)
                   const isActive = d.id === activeDesignId
                   return (
                     <div
                       key={d.id}
-                      className={`group flex items-center transition-colors ${
+                      className={`group relative flex items-center transition-colors ${
                         isActive ? 'bg-[#00d4ff]/10 text-[#00d4ff]' : 'text-muted-foreground hover:bg-[#30363d]'
                       }`}
                     >
@@ -202,23 +223,47 @@ export function Sidebar({ onAddNode, onAddGroupRect, onAddText, onScan, onOpenIm
                         <Icon size={14} className="shrink-0" />
                         <span className="truncate">{d.name}</span>
                       </button>
-                      <button
-                        aria-label={`Edit ${d.name}`}
-                        title="Edit canvas"
-                        onClick={() => { openDesignModal({ mode: 'edit', design: d }); setDesignSwitcherOpen(false) }}
-                        className="shrink-0 p-1.5 text-muted-foreground hover:text-foreground cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity"
+                      {/* Overlaid, not in the flow: hidden actions must not eat the name's width. */}
+                      <div
+                        data-testid="design-row-actions"
+                        className="absolute inset-y-0 right-0 flex items-center bg-[#30363d] pl-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:pointer-events-auto transition-opacity"
                       >
-                        <Pencil size={12} />
-                      </button>
-                      <button
-                        aria-label={`Delete ${d.name}`}
-                        title="Delete canvas"
-                        disabled={designs.length <= 1}
-                        onClick={() => handleDesignDelete(d)}
-                        className="shrink-0 p-1.5 pr-2 text-muted-foreground hover:text-[#f85149] cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity disabled:opacity-0"
-                      >
-                        <Trash2 size={12} />
-                      </button>
+                        <button
+                          aria-label={`Move ${d.name} up`}
+                          title="Move up"
+                          disabled={index === 0}
+                          onClick={() => handleDesignMove(index, -1)}
+                          className="shrink-0 p-1 text-muted-foreground hover:text-foreground cursor-pointer disabled:opacity-0 disabled:cursor-default"
+                        >
+                          <ChevronUp size={12} />
+                        </button>
+                        <button
+                          aria-label={`Move ${d.name} down`}
+                          title="Move down"
+                          disabled={index === designs.length - 1}
+                          onClick={() => handleDesignMove(index, 1)}
+                          className="shrink-0 p-1 text-muted-foreground hover:text-foreground cursor-pointer disabled:opacity-0 disabled:cursor-default"
+                        >
+                          <ChevronDown size={12} />
+                        </button>
+                        <button
+                          aria-label={`Edit ${d.name}`}
+                          title="Edit canvas"
+                          onClick={() => { openDesignModal({ mode: 'edit', design: d }); setDesignSwitcherOpen(false) }}
+                          className="shrink-0 p-1.5 text-muted-foreground hover:text-foreground cursor-pointer"
+                        >
+                          <Pencil size={12} />
+                        </button>
+                        <button
+                          aria-label={`Delete ${d.name}`}
+                          title="Delete canvas"
+                          disabled={designs.length <= 1}
+                          onClick={() => handleDesignDelete(d)}
+                          className="shrink-0 p-1.5 pr-2 text-muted-foreground hover:text-[#f85149] cursor-pointer disabled:opacity-0"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
                     </div>
                   )
                 })}
@@ -251,7 +296,11 @@ export function Sidebar({ onAddNode, onAddGroupRect, onAddText, onScan, onOpenIm
             label="Documentation"
             collapsed={collapsed}
             active={view === 'documentation'}
-            onClick={() => setView('documentation')}
+            onClick={() => {
+              setView('documentation')
+              // Lands on the homepage, unless the open document has unsaved edits.
+              void useDocsStore.getState().openHome()
+            }}
             dataTour="documentation"
           />
         )}

@@ -71,6 +71,10 @@ Every feature, with how to turn it on and use it, is described in **[FEATURES.md
 
 Docker (from the **[pre-built GHCR images](./INSTALLATION.md#pre-built-docker-images)**), Proxmox LXC, **[bare metal without Docker](./INSTALLATION.md#bare-metal--no-docker)** (`sudo bash scripts/install-baremetal.sh` — systemd unit plus nginx on a Debian/Ubuntu host), build from source, configuration, and development setup are all covered in **[INSTALLATION.md](./INSTALLATION.md)**.
 
+### ☁️ One-Click Cloud Deploy
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/Homelable/)
+
 ---
 
 ## Rack Canvas
@@ -134,7 +138,7 @@ restart the backend:
 
 Use this URL to read your documentation:
 
-`http://<your-homelab-ip>/docs?key=your-secret-key`
+`http://<your-homelab-ip>/documentation?key=your-secret-key`
 
 The page shows the document tree, the filter box and any page you pick, plus its earlier
 versions. Nothing can be written: no editing, no restoring, no deleting. Your device
@@ -316,6 +320,18 @@ Each host is linked to its guests with a `virtual` edge. vCPU / RAM / disk are i
 
 ---
 
+## Session duration
+
+With local auth, a login lasts 24 hours. Change it in your `.env` (value in minutes), then restart the backend:
+
+```env
+ACCESS_TOKEN_EXPIRE_MINUTES=10080   # 1 week
+```
+
+The session is kept per tab: closing the tab or the browser always asks for a new login. To keep the canvas on a screen permanently, use [Live View](#live-view-read-only-public-canvas) instead — it needs no login at all. OIDC sessions use `OIDC_SESSION_EXPIRE_MINUTES` (max 1440).
+
+---
+
 ## Live View (read-only public canvas)
 
 Live View lets you share a read-only snapshot of your canvas with anyone on your network — no login required. It is disabled by default.
@@ -368,6 +384,8 @@ Restart the backend (`docker compose restart backend`).
   "last_scan_at": "2026-05-14T10:00:00+00:00"
 }
 ```
+
+Counts are per device: a device drawn on several canvases is counted once. Canvas furniture with no device behind it (groups, text) counts as `unknown`.
 
 ### gethomepage `services.yaml` snippet
 

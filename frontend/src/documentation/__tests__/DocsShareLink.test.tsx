@@ -24,7 +24,10 @@ vi.mock('@/api/client', () => ({
     }),
     export: vi.fn(),
   },
-  scanApi: { pending: vi.fn().mockResolvedValue({ data: [] }) },
+  scanApi: {
+    pending: vi.fn().mockResolvedValue({ data: [] }),
+    getConfig: vi.fn().mockResolvedValue({ data: { ranges: [] } }),
+  },
   docsviewApi: { getConfig: vi.fn() },
 }))
 
@@ -61,7 +64,7 @@ describe('the read-only documentation link', () => {
 
     // The key is escaped: it is whatever the admin typed into .env.
     await waitFor(() =>
-      expect(copy).toHaveBeenCalledWith(`${window.location.origin}/docs?key=a%20key`),
+      expect(copy).toHaveBeenCalledWith(`${window.location.origin}/documentation?key=a%20key`),
     )
     const { toast } = await import('sonner')
     expect(toast.success).toHaveBeenCalledWith('Read-only link copied')

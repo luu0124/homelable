@@ -23,6 +23,35 @@ from app.core.config import APP_VERSION, settings
 logger = logging.getLogger(__name__)
 
 
+# Column additions to `rack_cables`, oldest first. `create_all` never adds a
+# column to an existing table, so each is an idempotent ALTER run at boot.
+RACK_CABLE_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    # Editable annotations: a label the user can print on the canvas, plus the
+    # same free-form property records nodes carry.
+    (
+        "rack_cables.label_visible",
+        "ALTER TABLE rack_cables ADD COLUMN label_visible BOOLEAN NOT NULL DEFAULT 0",
+    ),
+    ("rack_cables.properties", "ALTER TABLE rack_cables ADD COLUMN properties JSON"),
+    # Where the user dragged the annotation plate, as an offset from the run's
+    # midpoint. 0/0 is the midpoint itself — what every existing cable showed.
+    (
+        "rack_cables.label_offset_x",
+        "ALTER TABLE rack_cables ADD COLUMN label_offset_x REAL NOT NULL DEFAULT 0",
+    ),
+    (
+        "rack_cables.label_offset_y",
+        "ALTER TABLE rack_cables ADD COLUMN label_offset_y REAL NOT NULL DEFAULT 0",
+    ),
+)
+
+# Plate colour overrides on `rack_devices` beyond the panel fill: the label and
+# the port bays. Both nullable — NULL is "let the renderer decide".
+RACK_DEVICE_COLOR_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("rack_devices.text_color", "ALTER TABLE rack_devices ADD COLUMN text_color TEXT"),
+    ("rack_devices.bay_color", "ALTER TABLE rack_devices ADD COLUMN bay_color TEXT"),
+)
+
 # DDL for the documents feature that `Base.metadata.create_all` does not apply:
 # the column additions it never makes to an existing table, plus a virtual table
 # and partial indexes it cannot express at all. Shared with the test fixtures so
@@ -55,6 +84,7 @@ DOCUMENT_DDL: tuple[tuple[str, str], ...] = (
     # is distinguishable from "edited" — `created_at` and `updated_at` are two
     # separate clock reads on insert and are never equal.
     ("documents.edited_at", "ALTER TABLE documents ADD COLUMN edited_at DATETIME"),
+    ("documents.is_homepage", "ALTER TABLE documents ADD COLUMN is_homepage BOOLEAN DEFAULT 0"),
     ("document_revisions.reason", "ALTER TABLE document_revisions ADD COLUMN reason TEXT"),
     (
         "documents_fts.table",
@@ -77,7 +107,36 @@ DOCUMENT_DDL: tuple[tuple[str, str], ...] = (
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_documents_design "
         "ON documents(design_id) WHERE design_id IS NOT NULL",
     ),
+    (
+        "documents.is_homepage.unique",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_documents_homepage "
+        "ON documents(is_homepage) WHERE is_homepage = 1",
+    ),
 )
+
+
+async def _backfill_design_positions(conn: AsyncConnection) -> None:
+    """Give every design without a `position` one after the last positioned design.
+
+    Unpositioned rows are numbered in creation order, so an upgrade lists the
+    canvases exactly as before. Only NULLs are touched: re-running is a no-op
+    and a user's ordering is never rewritten. Numbered in Python rather than in
+    one UPDATE, whose subqueries would see the rows it is changing.
+    """
+    try:
+        top = (await conn.exec_driver_sql("SELECT MAX(position) FROM designs")).scalar()
+        rows = (
+            await conn.exec_driver_sql(
+                "SELECT id FROM designs WHERE position IS NULL ORDER BY created_at, id"
+            )
+        ).fetchall()
+        start = (top if top is not None else -1) + 1
+        for offset, (design_id,) in enumerate(rows):
+            await conn.exec_driver_sql(
+                "UPDATE designs SET position = ? WHERE id = ?", (start + offset, design_id)
+            )
+    except OperationalError as exc:
+        logger.warning("Migration designs.position.backfill failed: %s", exc)
 
 
 async def _try_migrate(conn: AsyncConnection, sql: str, *, label: str) -> None:
@@ -255,6 +314,7 @@ async def init_db() -> None:
             await conn.exec_driver_sql("UPDATE device_inventory SET properties = '[]' WHERE properties IS NULL")
         with suppress(OperationalError):
             await conn.exec_driver_sql("ALTER TABLE scan_runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'ip'")
+        await _try_migrate(conn, "ALTER TABLE scan_runs ADD COLUMN label TEXT", label="scan_runs.label")
         # --- Zigbee schema migrations (logged variant per CLAUDE.md feedback) ---
         zigbee_migrations: list[tuple[str, str]] = [
             ("nodes.ieee_address", "ALTER TABLE nodes ADD COLUMN ieee_address TEXT"),
@@ -375,6 +435,12 @@ async def init_db() -> None:
             row2 = await conn.exec_driver_sql("SELECT id FROM designs WHERE design_type = 'network' LIMIT 1")
             default = row2.fetchone()
             _default_design_id = default[0] if default else _default_design_id
+        # User-chosen order of the canvas list (#461). Existing rows keep the
+        # creation order they have always been listed in.
+        await _try_migrate(
+            conn, "ALTER TABLE designs ADD COLUMN position INTEGER", label="designs.position",
+        )
+        await _backfill_design_positions(conn)
 
         # Add design_id to nodes
         await _try_migrate(
@@ -436,21 +502,17 @@ async def init_db() -> None:
             logger.warning("canvas_state migration failed: %s", exc)
         # --- end Electrical designs schema migrations --------------------------
 
-        # Rack cables gained editable annotations: a label the user can print on
-        # the canvas, plus the same free-form property records nodes carry.
-        rack_cable_migrations: list[tuple[str, str]] = [
-            (
-                "rack_cables.label_visible",
-                "ALTER TABLE rack_cables ADD COLUMN label_visible BOOLEAN NOT NULL DEFAULT 0",
-            ),
-            ("rack_cables.properties", "ALTER TABLE rack_cables ADD COLUMN properties JSON"),
-        ]
-        for label, sql in rack_cable_migrations:
+        for label, sql in RACK_CABLE_MIGRATIONS:
             await _try_migrate(conn, sql, label=label)
         with suppress(OperationalError):
             await conn.exec_driver_sql(
                 "UPDATE rack_cables SET properties = '[]' WHERE properties IS NULL"
             )
+
+        # Label and port-bay colour overrides on a mount. NULL — every existing
+        # row — keeps the renderer's defaults.
+        for label, sql in RACK_DEVICE_COLOR_MIGRATIONS:
+            await _try_migrate(conn, sql, label=label)
 
         # A mount can override when its plate draws its sockets. Existing rows
         # keep the old behaviour, which is exactly what "auto" means.
@@ -578,6 +640,9 @@ async def init_db() -> None:
             # A zone or a group describes no device, so it has no inventory row to
             # keep its text on. Furniture keeps it here instead — see `Node.description`.
             ("nodes.description", "ALTER TABLE nodes ADD COLUMN description TEXT"),
+            # The device's own port numbering, per connection point (#495). Added
+            # before `_drop_legacy_node_columns`, whose rebuild copies it across.
+            ("nodes.port_labels", "ALTER TABLE nodes ADD COLUMN port_labels JSON"),
         ):
             await _try_migrate(conn, sql, label=label)
         # 3.3.x — the inventory row owns the device's rack modelisation: the
@@ -598,6 +663,14 @@ async def init_db() -> None:
                 "ALTER TABLE device_inventory ADD COLUMN rack_col_span INTEGER",
             ),
             ("device_inventory.rack_color", "ALTER TABLE device_inventory ADD COLUMN rack_color TEXT"),
+            (
+                "device_inventory.rack_text_color",
+                "ALTER TABLE device_inventory ADD COLUMN rack_text_color TEXT",
+            ),
+            (
+                "device_inventory.rack_bay_color",
+                "ALTER TABLE device_inventory ADD COLUMN rack_bay_color TEXT",
+            ),
             ("device_inventory.rack_ports", "ALTER TABLE device_inventory ADD COLUMN rack_ports JSON"),
         ):
             await _try_migrate(conn, sql, label=label)
@@ -659,6 +732,7 @@ _NODE_COLUMNS_SQL = (
     "custom_icon VARCHAR,"
     "description TEXT,"
     "show_port_numbers BOOLEAN,"
+    "port_labels JSON,"
     "width FLOAT,"
     "height FLOAT,"
     "bottom_handles INTEGER,"
@@ -671,8 +745,8 @@ _NODE_COLUMNS_SQL = (
 
 _NODE_KEPT = (
     "id, type, label, design_id, device_id, display_view, pos_x, pos_y, parent_id, container_mode, "
-    "custom_colors, custom_icon, description, show_port_numbers, width, height, bottom_handles, "
-    "top_handles, left_handles, right_handles, created_at, updated_at"
+    "custom_colors, custom_icon, description, show_port_numbers, port_labels, width, height, "
+    "bottom_handles, top_handles, left_handles, right_handles, created_at, updated_at"
 )
 
 

@@ -270,6 +270,29 @@ def test_network_block_takes_the_first_ip_of_a_multi_ip_device():
     assert "10.0.0.0/24" in t.block_network(_device(ip="10.0.0.5, 192.168.1.20"))
 
 
+def test_subnet_follows_the_configured_scan_range_over_the_slash_24():
+    # #581: a /23 LAN printed as two /24s.
+    assert t._guess_subnet("192.168.0.10", ["192.168.0.0/23"]) == "192.168.0.0/23"
+    assert t._guess_subnet("192.168.1.20", ["192.168.0.0/23"]) == "192.168.0.0/23"
+    assert t._guess_subnet("192.168.2.5", ["192.168.0.0/23"]) == "192.168.2.0/24"
+
+
+def test_subnet_picks_the_most_specific_range_and_skips_bad_ones():
+    ranges = ["10.0.0.0/16", "bogus", "fd00::/8", "10.0.5.0/24"]
+    assert t._guess_subnet("10.0.5.7", ranges) == "10.0.5.0/24"
+    assert t._guess_subnet("10.0.9.1", ranges) == "10.0.0.0/16"
+
+
+def test_subnet_is_none_for_a_non_ipv4_address():
+    assert t._guess_subnet("fe80::1", []) is None
+    assert t._guess_subnet("nas.local", []) is None
+
+
+def test_network_block_reads_the_live_scan_ranges(monkeypatch):
+    monkeypatch.setattr(t.settings, "scanner_ranges", ["192.168.0.0/23"])
+    assert "192.168.0.0/23" in t.block_network(_device(ip="192.168.1.20"))
+
+
 def test_network_block_survives_a_device_with_no_ip():
     assert "**Subnet / VLAN** — _…_" in t.block_network(_device(ip=None))
 
@@ -390,3 +413,88 @@ def test_facts_snapshot_is_stable_when_services_are_reordered():
 
 def test_facts_snapshot_changes_when_the_ip_moves():
     assert t.facts_snapshot(_device()) != t.facts_snapshot(_device(ip="192.168.1.21"))
+
+
+# ── homepage ────────────────────────────────────────────────────────────────
+
+
+def _design(**overrides):
+    return SimpleNamespace(**{"id": "d1", "name": "Home lab", "design_type": "network", **overrides})
+
+
+def _doc(**overrides):
+    base = {
+        "id": "p1", "kind": "page", "title": "VLAN plan", "parent_id": None,
+        "sort_order": 0, "starred": False, "device_id": None,
+    }
+    return SimpleNamespace(**{**base, **overrides})
+
+
+def _home(**context):
+    return t.render_homepage_document(
+        "Home",
+        designs=context.get("designs", []),
+        docs=context.get("docs", []),
+        devices=context.get("devices", []),
+        today=date(2026, 10, 30),
+    )
+
+
+def test_homepage_frontmatter_names_its_template():
+    md = _home()
+    assert "template: homepage" in md
+    assert "# Home" in md
+
+
+def test_homepage_links_every_canvas_with_its_kind():
+    md = _home(designs=[_design(), _design(id="d2", name="Rack A", design_type="rack")])
+    assert "- [Home lab](?design=d1) — network" in md
+    assert "- [Rack A](?design=d2) — rack" in md
+
+
+def test_homepage_indexes_the_top_of_the_library_starred_first():
+    docs = [
+        _doc(id="p1", title="Zeta"),
+        _doc(id="f1", kind="folder", title="Runbooks"),
+        _doc(id="p2", title="Nested", parent_id="f1"),
+        _doc(id="s1", title="Alpha", starred=True, parent_id="f1"),
+    ]
+    md = _home(docs=docs)
+    library = md.split("## Library")[1].split("## Key devices")[0]
+    lines = [line for line in library.splitlines() if line.startswith("- ")]
+    assert lines == [
+        "- ★ [[doc:s1|Alpha]]",
+        "- [[doc:f1|Runbooks]] (folder)",
+        "- [[doc:p1|Zeta]]",
+    ]
+
+
+def test_homepage_lists_key_devices_and_links_only_documented_ones():
+    router = _device(id="r1", label="gw", type="router", ip="192.168.1.1")
+    nas = _device(id="n1", label="nas-01", type="nas", ip="192.168.1.20")
+    laptop = _device(id="l1", label="laptop", type="laptop")
+    docs = [_doc(id="dd", kind="device", device_id="n1", title="nas-01")]
+    md = _home(devices=[nas, laptop, router], docs=docs)
+    section = md.split("## Key devices")[1].split("## Next steps")[0]
+    assert "- gw · router — `192.168.1.1`" in section
+    assert "- [[device:n1|nas-01]] · nas — `192.168.1.20`" in section
+    assert section.index("gw") < section.index("nas-01")
+    assert "laptop" not in section
+
+
+def test_homepage_caps_the_key_device_list():
+    devices = [_device(id=f"s{i}", label=f"srv-{i:02}", type="server") for i in range(20)]
+    section = _home(devices=devices).split("## Key devices")[1].split("## Next steps")[0]
+    assert sum(1 for line in section.splitlines() if line.startswith("- ")) == 8
+
+
+def test_homepage_ends_with_a_tickable_checklist():
+    steps = _home().split("## Next steps")[1]
+    assert steps.count("- [ ] ") == 4
+
+
+def test_homepage_says_so_when_there_is_nothing_to_list():
+    md = _home()
+    assert "_No canvas yet._" in md
+    assert "_Nothing filed yet" in md
+    assert "_No router, switch, NAS or hypervisor" in md

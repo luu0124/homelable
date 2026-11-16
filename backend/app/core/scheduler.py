@@ -9,7 +9,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.core.config import proxmox_sync_endpoints, settings
 from app.db.database import AsyncSessionLocal
 from app.db.models import InventoryDevice, Node
 from app.services.status_checker import check_node, check_services
@@ -194,40 +194,67 @@ async def _run_service_checks() -> None:
 
 
 async def _run_proxmox_sync() -> None:
-    """Fetch the Proxmox inventory and upsert it into pending (auto-sync).
+    """Fetch every configured Proxmox inventory and upsert it into pending
+    (auto-sync).
 
-    Records a ScanRun (kind=proxmox) so the scheduled sync shows in Scan
-    history, exactly like the manual /sync-now and /import-pending paths.
+    Records one ScanRun (kind=proxmox) per endpoint so the scheduled sync shows
+    in Scan history, exactly like the manual /sync-now and /import-pending
+    paths. Endpoints run one after another; a failing one marks its own run
+    as errored and the next still syncs.
     """
     if not settings.proxmox_sync_enabled:
         return
-    if not (settings.proxmox_host and settings.proxmox_token_id and settings.proxmox_token_secret):
+    endpoints = proxmox_sync_endpoints(settings)
+    if not endpoints:
         logger.warning("Proxmox auto-sync enabled but host/token not configured — skipping")
         return
     # Lazy import to avoid a circular import at module load.
-    from app.api.routes.proxmox import _background_proxmox_import
+    from app.api.routes.proxmox import (
+        _background_proxmox_import,
+        create_proxmox_run,
+        proxmox_import_args,
+    )
+
+    for endpoint in endpoints:
+        async with AsyncSessionLocal() as db:
+            run = await create_proxmox_run(db, endpoint)
+            run_id = run.id
+
+        # Shares the manual-sync flow: fetch + persist + mark the run done/error +
+        # broadcast the inventory-reload signal.
+        args, kwargs = proxmox_import_args(run_id, endpoint)
+        await _background_proxmox_import(*args, **kwargs)
+
+
+async def _run_unraid_sync() -> None:
+    """Fetch the Unraid containers and upsert them into pending (auto-sync)."""
+    if not settings.unraid_sync_enabled:
+        return
+    if not (settings.unraid_host and settings.unraid_api_key):
+        logger.warning("Unraid auto-sync enabled but host/API key not configured - skipping")
+        return
+    from app.api.routes.unraid import _background_unraid_import
     from app.db.models import ScanRun
 
     async with AsyncSessionLocal() as db:
         run = ScanRun(
             status="running",
-            kind="proxmox",
-            ranges=[f"{settings.proxmox_host}:{settings.proxmox_port}"],
+            kind="unraid",
+            ranges=[f"{settings.unraid_host}:{settings.unraid_effective_port}"],
         )
         db.add(run)
         await db.commit()
         await db.refresh(run)
         run_id = run.id
 
-    # Shares the manual-sync flow: fetch + persist + mark the run done/error +
-    # broadcast the inventory-reload signal.
-    await _background_proxmox_import(
+    await _background_unraid_import(
         run_id,
-        settings.proxmox_host,
-        settings.proxmox_port,
-        settings.proxmox_token_id,
-        settings.proxmox_token_secret,
-        settings.proxmox_verify_tls,
+        settings.unraid_host,
+        settings.unraid_effective_port,
+        settings.unraid_api_key,
+        settings.unraid_verify_tls,
+        settings.unraid_use_https,
+        settings.unraid_sync_include_offline,
     )
 
 
@@ -330,6 +357,22 @@ def _add_proxmox_sync_job() -> None:
     )
 
 
+def _unraid_sync_interval() -> int:
+    # .env and the settings file bypass the >= 300 check on write, so clamp here
+    return max(300, settings.unraid_sync_interval)
+
+
+def _add_unraid_sync_job() -> None:
+    scheduler.add_job(
+        _run_unraid_sync,
+        "interval",
+        seconds=_unraid_sync_interval(),
+        id="unraid_sync",
+        max_instances=1,
+        coalesce=True,
+    )
+
+
 def _add_zigbee_sync_job() -> None:
     scheduler.add_job(
         _run_zigbee_sync,
@@ -384,6 +427,8 @@ def start_scheduler() -> None:
             _add_service_check_job()
     if settings.proxmox_sync_enabled:
         _add_proxmox_sync_job()
+    if settings.unraid_sync_enabled:
+        _add_unraid_sync_job()
     if settings.zigbee_sync_enabled:
         _add_zigbee_sync_job()
     if settings.zwave_sync_enabled:
@@ -462,6 +507,31 @@ def set_proxmox_sync_enabled(enabled: bool) -> None:
     elif not enabled and job:
         scheduler.remove_job("proxmox_sync")
         logger.info("Proxmox auto-sync disabled")
+
+
+def reschedule_unraid_sync(interval_seconds: int) -> None:
+    """Update the Unraid auto-sync interval on the running scheduler (if enabled)."""
+    if interval_seconds < 300:
+        raise ValueError(f"interval_seconds must be >= 300, got {interval_seconds}")
+    if not scheduler.running:
+        logger.warning("Scheduler not running, skipping reschedule")
+        return
+    if scheduler.get_job("unraid_sync"):
+        scheduler.reschedule_job("unraid_sync", trigger="interval", seconds=interval_seconds)
+        logger.info("Unraid auto-sync rescheduled to every %ds", interval_seconds)
+
+
+def set_unraid_sync_enabled(enabled: bool) -> None:
+    """Add or remove the Unraid auto-sync job on the running scheduler."""
+    if not scheduler.running:
+        return
+    job = scheduler.get_job("unraid_sync")
+    if enabled and not job:
+        _add_unraid_sync_job()
+        logger.info("Unraid auto-sync enabled - every %ds", _unraid_sync_interval())
+    elif not enabled and job:
+        scheduler.remove_job("unraid_sync")
+        logger.info("Unraid auto-sync disabled")
 
 
 def reschedule_zigbee_sync(interval_seconds: int) -> None:

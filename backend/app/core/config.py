@@ -4,10 +4,33 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
+
+
+class ProxmoxEndpoint(BaseModel):
+    """One Proxmox VE endpoint: a standalone server or one node of a cluster.
+
+    ``name`` is optional. When set it scopes the synthetic ids of everything
+    the endpoint returns (host ``pve-node-{name}-{node}``, guest
+    ``pve-{name}-{vmid}``). Without it the ids are built from the Proxmox node
+    name alone, so two standalone servers sharing a node name (the installer
+    default is ``pve``) and a VMID overwrite each other's inventory rows.
+    """
+
+    name: str = ""
+    host: str
+    port: int = Field(8006, ge=1, le=65535)
+    token_id: str
+    token_secret: str
+    verify_tls: bool = True
+
+    @field_validator("name", "host")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        return value.strip()
 
 
 def origin_of(url: str) -> str:
@@ -213,6 +236,22 @@ class Settings(BaseSettings):
     # Leave empty to keep the feature disabled (default).
     homepage_api_key: str = ""
 
+    # Git sync — push the documentation and every diagram to a git repository,
+    # on an explicit Sync. Env-only, like every connection config: the token is a
+    # credential, never persisted by the app nor returned by the API.
+    # GIT_SYNC_REPO_URL empty = the feature is off.
+    git_sync_repo_url: str = ""
+    git_sync_branch: str = "main"
+    # Folder inside the repository the sync writes to; empty = repository root.
+    git_sync_path: str = ""
+    # HTTPS auth: a personal access token, sent as basic auth with this username.
+    git_sync_token: str = ""
+    git_sync_username: str = "git"
+    # SSH auth: path to a private key readable by the backend (a deploy key).
+    git_sync_ssh_key: str = ""
+    git_sync_author_name: str = "Homelable"
+    git_sync_author_email: str = "homelable@localhost"
+
     # Proxmox VE import.
     # Token = a real credential → env/.env ONLY, never persisted by the app to
     # scan_config.json and never returned by the API. token_id is
@@ -223,8 +262,27 @@ class Settings(BaseSettings):
     proxmox_host: str = ""
     proxmox_port: int = 8006
     proxmox_verify_tls: bool = True
+    # More endpoints, as a JSON list of ProxmoxEndpoint (PROXMOX_ENDPOINTS).
+    # Synced alongside the single PROXMOX_HOST endpoint above, which stays
+    # supported as-is.
+    proxmox_endpoints: list[ProxmoxEndpoint] = []
     proxmox_sync_enabled: bool = False
     proxmox_sync_interval: int = 3600  # seconds (floor 300 enforced on write)
+
+    # Unraid import (Docker containers). Same rules as Proxmox: the API key is a
+    # credential -> env/.env ONLY, never persisted by the app and never returned
+    # by the API. Connection config is env-only; only the auto-sync activation
+    # is persisted.
+    unraid_api_key: str = ""
+    unraid_host: str = ""
+    # Unraid serves plain HTTP unless "Use SSL/TLS" is turned on in its settings.
+    unraid_use_https: bool = False
+    unraid_port: int | None = None  # None = 443 for HTTPS, 80 for HTTP
+    unraid_verify_tls: bool = False  # Unraid's own certificate is self-signed
+    unraid_sync_enabled: bool = False
+    unraid_sync_interval: int = 3600  # seconds (floor 300 enforced on write)
+    # Import stopped containers on auto-sync / sync-now too.
+    unraid_sync_include_offline: bool = True
 
     # Zigbee2MQTT auto-sync import.
     # MQTT credentials are secrets → env/.env ONLY, never persisted by the app to
@@ -292,6 +350,11 @@ class Settings(BaseSettings):
         return self.unifi_host
 
     @property
+    def unraid_effective_port(self) -> int:
+        """UNRAID_PORT if set, else the default port of the configured scheme."""
+        return self.unraid_port or (443 if self.unraid_use_https else 80)
+
+    @property
     def unifi_effective_port(self) -> int:
         """Return port from UNIFI_URL if set, else UNIFI_PORT."""
         if self.unifi_url:
@@ -308,6 +371,10 @@ class Settings(BaseSettings):
         if self.upload_dir:
             return Path(self.upload_dir)
         return Path(self.sqlite_path).parent / "uploads"
+
+    def git_sync_dir(self) -> Path:
+        """Working copy of the git sync, on the same volume as the SQLite DB."""
+        return Path(self.sqlite_path).parent / "git-sync"
 
     def load_overrides(self) -> None:
         """Load runtime scan config overrides written by the API."""
@@ -335,6 +402,13 @@ class Settings(BaseSettings):
                 self.proxmox_sync_enabled = bool(data["proxmox_sync_enabled"])
             if "proxmox_sync_interval" in data:
                 self.proxmox_sync_interval = int(data["proxmox_sync_interval"])
+            # Unraid: auto-sync activation only, same reason as Proxmox.
+            if "unraid_sync_enabled" in data:
+                self.unraid_sync_enabled = bool(data["unraid_sync_enabled"])
+            if "unraid_sync_interval" in data:
+                self.unraid_sync_interval = int(data["unraid_sync_interval"])
+            if "unraid_sync_include_offline" in data:
+                self.unraid_sync_include_offline = bool(data["unraid_sync_include_offline"])
             # Zigbee/Z-Wave: only the auto-sync activation is persisted. MQTT
             # connection config (host, port, credentials, topic, tls) is env-only
             # by design — never read from or written to this file.
@@ -378,6 +452,11 @@ class Settings(BaseSettings):
             # be written to disk — that is the single source of truth.
             "proxmox_sync_enabled": self.proxmox_sync_enabled,
             "proxmox_sync_interval": self.proxmox_sync_interval,
+            # Unraid: only the auto-sync activation. Host/port/key/verify_tls
+            # are env-only.
+            "unraid_sync_enabled": self.unraid_sync_enabled,
+            "unraid_sync_interval": self.unraid_sync_interval,
+            "unraid_sync_include_offline": self.unraid_sync_include_offline,
             # Zigbee/Z-Wave: only the auto-sync activation is persisted. MQTT
             # connection config (host/port/credentials/topic/tls) is env-only.
             "zigbee_sync_enabled": self.zigbee_sync_enabled,
@@ -393,6 +472,38 @@ class Settings(BaseSettings):
             "unifi_import_known_clients": self.unifi_import_known_clients,
             "unifi_import_active_clients": self.unifi_import_active_clients,
         }))
+
+
+def proxmox_sync_endpoints(s: Settings) -> list[ProxmoxEndpoint]:
+    """Every fully configured Proxmox endpoint, the legacy single one first.
+
+    The legacy ``PROXMOX_HOST`` / ``PROXMOX_TOKEN_*`` endpoint counts only with
+    a host and both token fields. A ``PROXMOX_ENDPOINTS`` entry repeating an
+    endpoint already listed (same host and port) is dropped, so a server is
+    never synced twice per run.
+    """
+    endpoints: list[ProxmoxEndpoint] = []
+    if s.proxmox_host and s.proxmox_token_id and s.proxmox_token_secret:
+        endpoints.append(ProxmoxEndpoint(
+            host=s.proxmox_host,
+            port=s.proxmox_port,
+            token_id=s.proxmox_token_id,
+            token_secret=s.proxmox_token_secret,
+            verify_tls=s.proxmox_verify_tls,
+        ))
+    seen = {(normalize_host(e.host), e.port) for e in endpoints}
+    for endpoint in s.proxmox_endpoints:
+        key = (normalize_host(endpoint.host), endpoint.port)
+        if key in seen:
+            continue
+        seen.add(key)
+        endpoints.append(endpoint)
+    return endpoints
+
+
+def normalize_host(host: str) -> str:
+    """Compare-ready host: trimmed, no trailing dot, lowercase."""
+    return host.strip().rstrip(".").lower()
 
 
 settings = Settings()  # type: ignore[call-arg]

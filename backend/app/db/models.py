@@ -23,6 +23,9 @@ class Design(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     design_type: Mapped[str] = mapped_column(String, nullable=False, default="network")
     icon: Mapped[str | None] = mapped_column(String, nullable=True, default="dashboard")
+    # Place in the canvas list, 0 first. Nullable so a row written without one
+    # (an older client, raw SQL) still lists — last, by creation date.
+    position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
@@ -70,6 +73,10 @@ class Node(Base):
     # node that does draw a device: its notes belong to the inventory row.
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     show_port_numbers: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Text printed in place of a connection point's 1..N number, keyed by source
+    # handle ID ('top', 'bottom-3'…), so a node can carry the device's own port
+    # numbering (#495). NULL when every point shows its number.
+    port_labels: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
     width: Mapped[float | None] = mapped_column(Float, nullable=True)
     height: Mapped[float | None] = mapped_column(Float, nullable=True)
     bottom_handles: Mapped[int] = mapped_column(Integer, default=1)
@@ -180,6 +187,10 @@ class RackDevice(Base):
     col_span: Mapped[int] = mapped_column(Integer, default=12)
     faceplate_id: Mapped[str] = mapped_column(String, nullable=False, default="blank-1u")
     color: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Plate label colour and port-bay (strip) colour overrides. NULL leaves the
+    # renderer in charge: a readable label colour, the template's bay fill.
+    text_color: Mapped[str | None] = mapped_column(String, nullable=True)
+    bay_color: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, default="unknown")
     # When the plate draws its sockets: "auto" (the faceplate decides), "always"
     # or "hover". A canvas display choice about the mount, not about the device.
@@ -214,6 +225,10 @@ class RackCable(Base):
     label: Mapped[str | None] = mapped_column(String, nullable=True)
     # Print the label next to the run on the canvas.
     label_visible: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Where the user dragged the annotation plate, in canvas units from the run's
+    # midpoint — so the plate follows the cable when either end moves.
+    label_offset_x: Mapped[float] = mapped_column(Float, default=0.0)
+    label_offset_y: Mapped[float] = mapped_column(Float, default=0.0)
     # [{key, value, icon, visible}] — same records nodes carry; the visible ones
     # are drawn beside the cable.
     properties: Mapped[list[Any]] = mapped_column(JSON, default=list)
@@ -289,6 +304,8 @@ class InventoryDevice(Base):
     rack_u_height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     rack_col_span: Mapped[int | None] = mapped_column(Integer, nullable=True)
     rack_color: Mapped[str | None] = mapped_column(String, nullable=True)
+    rack_text_color: Mapped[str | None] = mapped_column(String, nullable=True)
+    rack_bay_color: Mapped[str | None] = mapped_column(String, nullable=True)
     # [{id, label, type, x, y}] — x/y are unit coordinates on the plate.
     rack_ports: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
 
@@ -329,6 +346,9 @@ class ScanRun(Base):
     status: Mapped[str] = mapped_column(String, default="running")
     kind: Mapped[str] = mapped_column(String, default="ip", server_default="ip")
     ranges: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # Which source a run covers, for display: the Proxmox endpoint's name, else
+    # its host. Tells apart the runs of one sync across several servers.
+    label: Mapped[str | None] = mapped_column(String)
     devices_found: Mapped[int] = mapped_column(Integer, default=0)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -383,6 +403,9 @@ class Document(Base):
     frontmatter: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     starred: Mapped[bool] = mapped_column(Boolean, default=False)
+    # The page Documentation opens on. At most one row holds it — enforced by a
+    # partial unique index in `database.init_db` — and only a page may.
+    is_homepage: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     template_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # The device facts as they read when this document was scaffolded or last

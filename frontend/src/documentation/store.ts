@@ -164,6 +164,12 @@ export interface DocsState {
   open: (id: string) => Promise<void>
   /** Open the document describing a device, writing one first if it has none. */
   openForDevice: (deviceId: string, fallbackTitle?: string) => Promise<boolean>
+  /**
+   * Open the homepage, whatever was open before — unless that document has
+   * unsaved edits, or another one is already opening. False when it opened
+   * nothing.
+   */
+  openHome: () => Promise<boolean>
   close: () => void
 
   startEdit: () => void
@@ -186,6 +192,10 @@ export interface DocsState {
   /** Rewrite the `tags:` list in the open document's frontmatter. */
   setTags: (tags: string[]) => Promise<boolean>
   toggleStar: (id: string) => Promise<void>
+  /** The emoji the tree shows for a document; `null` restores the kind icon. */
+  setIcon: (id: string, icon: string | null) => Promise<boolean>
+  /** Make this page the homepage; the server takes the flag off the old one. */
+  setHomepage: (id: string) => Promise<boolean>
   markReviewed: (id: string) => Promise<void>
   resyncFacts: (id: string) => Promise<void>
   remove: (id: string) => Promise<void>
@@ -336,6 +346,21 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
     })
     if (!created) return false
     await get().open(created.id)
+    return true
+  },
+
+  openHome: async () => {
+    if (STANDALONE) return false
+    // Unsaved edits are never swapped out from under the user.
+    const busy = () => get().openLoading || get().dirty
+    if (busy()) return false
+    if (!get().loaded) await get().loadDocs()
+    // Something else may have opened a document while the list loaded.
+    if (busy()) return false
+    const home = get().docs.find((doc) => doc.is_homepage)
+    if (!home) return false
+    if (get().openDoc?.id === home.id) return true
+    await get().open(home.id)
     return true
   },
 
@@ -526,7 +551,13 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
         node_id: input.nodeId ?? null,
         template_id: input.templateId ?? null,
       })
-      set((state) => ({ docs: [...state.docs, data], openDoc: data }))
+      // A folder has nothing to read or write, so it never takes the viewer:
+      // swapping `openDoc` under a live `draft` would bind the editor — and its
+      // next save — to the folder.
+      set((state) => ({
+        docs: [...state.docs, data],
+        openDoc: data.kind === 'folder' ? state.openDoc : data,
+      }))
       return data
     } catch (error) {
       set({ loadError: message(error, 'Could not create that document') })
@@ -604,6 +635,36 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
       docs: state.docs.map((d) => (d.id === id ? { ...d, ...data } : d)),
       openDoc: state.openDoc?.id === id ? data : state.openDoc,
     }))
+  },
+
+  // A column, not frontmatter: unlike tags it is presentation for the tree and
+  // never part of the exported markdown, so it patches straight through.
+  setIcon: async (id, icon) => {
+    try {
+      const { data } = await documentsApi.update(id, { icon })
+      set((state) => ({
+        docs: state.docs.map((d) => (d.id === id ? { ...d, ...data } : d)),
+        openDoc: state.openDoc?.id === id ? data : state.openDoc,
+      }))
+      return true
+    } catch (error) {
+      set({ loadError: message(error, 'Could not set the icon') })
+      return false
+    }
+  },
+
+  setHomepage: async (id) => {
+    try {
+      const { data } = await documentsApi.update(id, { is_homepage: true })
+      set((state) => ({
+        docs: state.docs.map((d) => (d.id === id ? { ...d, ...data } : { ...d, is_homepage: false })),
+        openDoc: state.openDoc?.id === id ? data : state.openDoc && { ...state.openDoc, is_homepage: false },
+      }))
+      return true
+    } catch (error) {
+      set({ loadError: message(error, 'Could not set the homepage') })
+      return false
+    }
   },
 
   markReviewed: async (id) => {

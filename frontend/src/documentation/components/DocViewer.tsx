@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Menu } from '@base-ui/react/menu'
-import { Clock, Download, Ellipsis, History, Link2, Pencil, Plus, RefreshCw, Star, Trash2, X } from 'lucide-react'
+import { Clock, Download, Ellipsis, History, House, Link2, Pencil, Plus, RefreshCw, Star, Trash2, X } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
@@ -10,6 +10,7 @@ import { extractToc } from '../markdown/toc'
 import type { Doc, DocBacklink, DocRevision } from '../types'
 import type { LinkableDevice, LinkableDoc } from '../wikilinks'
 import { DocHistoryRail, RevisionPreview } from './DocHistory'
+import { IconPicker } from './IconPicker'
 
 /** Everything the history rail and the revision preview need, in one prop. */
 export interface HistoryControls {
@@ -48,6 +49,8 @@ interface Props {
   readOnly?: boolean
   onEdit?: () => void
   onToggleStar?: () => void
+  /** Makes this page the homepage. Only a page is offered it. */
+  onSetHomepage?: () => void
   onMarkReviewed?: () => void
   onRegenerate?: () => void
   /** Opens the update-from-device review for a drifted device document. */
@@ -60,6 +63,8 @@ interface Props {
   onToggleTask?: (body: string) => void
   /** Writes the whole tag list back into the document's frontmatter. */
   onSetTags?: (tags: string[]) => void
+  /** Sets the emoji the tree shows for this document; `null` clears it. */
+  onSetIcon?: (icon: string | null) => void
 }
 
 const NO_HISTORY: HistoryControls = {
@@ -90,6 +95,7 @@ export function DocViewer({
   readOnly = false,
   onEdit,
   onToggleStar,
+  onSetHomepage,
   onMarkReviewed,
   onUpdateFromDevice,
   onRegenerate,
@@ -99,6 +105,7 @@ export function DocViewer({
   onCreateFromLink,
   onToggleTask,
   onSetTags,
+  onSetIcon,
 }: Props) {
   const controls = history ?? NO_HISTORY
   const { data } = useMemo(() => parseFrontmatter(doc.body), [doc.body])
@@ -172,6 +179,22 @@ export function DocViewer({
               >
                 <Star className={cn(doc.starred && 'fill-current text-[var(--accent-orange,#ff6e00)]')} />
               </Button>
+              {doc.kind === 'page' && onSetHomepage && (
+                // Already the homepage: shown, not offered — there is nothing to
+                // switch it back to, only another page to pick instead.
+                <Button
+                  size="icon-xs"
+                  variant="ghost"
+                  title={doc.is_homepage ? 'This page is the homepage' : 'Set as homepage'}
+                  aria-label={doc.is_homepage ? 'This page is the homepage' : 'Set as homepage'}
+                  aria-pressed={Boolean(doc.is_homepage)}
+                  disabled={doc.is_homepage}
+                  onClick={onSetHomepage}
+                  className={cn('cursor-pointer', doc.is_homepage && 'text-primary disabled:opacity-100')}
+                >
+                  <House />
+                </Button>
+              )}
               <Button size="sm" variant="ghost" onClick={onEdit} className="cursor-pointer gap-1">
                 <Pencil size={13} /> Edit
               </Button>
@@ -291,6 +314,32 @@ export function DocViewer({
                 className="w-28 rounded bg-muted px-1.5 py-0.5 text-[10px] text-foreground outline-none ring-1 ring-border focus:ring-primary"
               />
             ))}
+          {!readOnly && onSetIcon && (
+            <IconPicker
+              icon={doc.icon}
+              onChange={onSetIcon}
+              trigger={
+                doc.icon ? (
+                  <button
+                    type="button"
+                    title="Change the tree icon"
+                    aria-label={`Tree icon ${doc.icon} — change`}
+                    className="flex cursor-pointer items-center rounded bg-muted px-1.5 py-0.5 text-[11px] leading-none hover:bg-muted/70"
+                  >
+                    {doc.icon}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    title="Give this document an emoji in the tree"
+                    className="flex cursor-pointer items-center gap-0.5 rounded bg-muted px-1.5 py-0.5 text-muted-foreground hover:text-foreground"
+                  >
+                    <Plus size={10} /> Icon
+                  </button>
+                )
+              }
+            />
+          )}
           {!doc.edited_at && (
             <span className="rounded bg-muted px-1.5 py-0.5 text-muted-foreground">
               Only the generated header so far

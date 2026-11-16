@@ -5,6 +5,7 @@ import { Logo } from '@/components/ui/Logo'
 import { useCanvasStore } from '@/stores/canvasStore'
 import { useDesignStore } from '@/stores/designStore'
 import { useRackStore } from '@/rack/store'
+import { GitSyncButton } from '@/components/common/GitSyncButton'
 import { RackToolbarActions } from './RackToolbarActions'
 import type { AutoLayoutMode } from '@/utils/zoneGrouping'
 
@@ -104,6 +105,10 @@ export function Toolbar({ onSave, onAutoLayout, onExport, onChangeStyle, onUndo,
           <Eye size={14} /> View
         </Button>
       )}
+      <GitSyncButton
+        unsaved={hasUnsavedChanges}
+        className="text-muted-foreground hover:text-foreground hover:bg-[#21262d]"
+      />
       <Button size="sm" variant="ghost" className="gap-1.5 text-muted-foreground hover:text-foreground cursor-pointer hover:bg-[#21262d]" onClick={onShortcuts} title="Keyboard shortcuts (?)">
         <HelpCircle size={14} />
       </Button>
@@ -127,7 +132,7 @@ export function Toolbar({ onSave, onAutoLayout, onExport, onChangeStyle, onUndo,
 
 const LAYOUT_MODES: { mode: Exclude<AutoLayoutMode, 'hierarchy'>; label: string; hint: string }[] = [
   { mode: 'type', label: 'Group by device type', hint: 'One zone per family: hardware, virtualization, IoT…' },
-  { mode: 'subnet', label: 'Group by subnet', hint: 'One zone per /24; devices without an IP stay loose' },
+  { mode: 'subnet', label: 'Group by subnet', hint: 'One zone per scan range (else per /24); devices without an IP stay loose' },
 ]
 
 /**
